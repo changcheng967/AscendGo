@@ -372,6 +372,7 @@ struct TensorCacheKeyHash {
     for(int i = 0; i < k.ndim; i++)
       h ^= std::hash<int64_t>()(k.dims[i]) << (i + 1);
     h ^= std::hash<int>()(k.dtype) << 5;
+    h ^= std::hash<int>()(k.format) << 7;
     return h;
   }
 };
@@ -708,29 +709,29 @@ struct Buffers {
   void* trunkBuf;           // Trunk output buffer
   void* maskBuf;            // Mask buffer
   void* scratchBuf;         // Scratch buffer for residual blocks
-  void* p1OutBuf;           // Policy head intermediate
+  void* residualMidBuf;     // Mid buffer for residual blocks (avoids in-place conv)
+  void* p1OutBuf;           // Policy head intermediate (ALWAYS float - CUDA: "Need to hold floats, not just halfs")
+  void* p1Out2Buf;          // Policy head p1Out converted to float in FP16 mode (for bias add)
   void* g1OutBuf;           // Policy head gpool intermediate
   void* g1Out2Buf;          // Policy head gpool intermediate 2
   void* g1ConcatBuf;        // Policy head gpool concat (always FP32)
-  void* g1ConcatFP16Buf;    // Policy head gpool concat FP16 version (for MatMulLayer in FP16 mode)
-  void* g1BiasBuf;          // Policy head bias
-  void* p1PassBuf;          // Policy pass intermediate
+  void* g1BiasBuf;          // Policy head bias (always FP32 - gpoolToBiasMul uses FP32)
+  void* p1PassBuf;          // Policy pass intermediate (always FP32)
   void* v1OutBuf;           // Value head intermediate
   void* v1Out2Buf;          // Value head intermediate 2
   void* v1MeanBuf;          // Value head mean buffer (always FP32)
-  void* v1MeanFP16Buf;      // Value head mean buffer FP16 version (for MatMulLayer in FP16 mode)
-  void* v2OutBuf;           // Value head v2 output
-  void* ownershipScratchBuf; // Ownership scratch buffer
+  void* v2OutBuf;           // Value head v2 output (always FP32)
+  void* ownershipScratchBuf; // Ownership scratch buffer (FP16 conv output before FP32 conversion)
+  void* maskSumBuf;         // Mask sum buffer (float, count of valid positions per batch)
+  void* maskFloatBuf;       // Mask as float (for BN operations)
 
-  // FP16 scratch buffers for output conversion (only used in FP16 mode)
-  // These hold FP16 outputs before conversion to FP32 final buffers
-  void* valueScratchBuf;       // FP16 value output before conversion
-  void* scoreValueScratchBuf;  // FP16 scoreValue output before conversion
-  void* policyScratchBuf;      // FP16 policy output before conversion
-  void* policyPassScratchBuf;  // FP16 policyPass output before conversion
+  // Global pooling block buffers (needed by GlobalPoolingResidualBlock in trunk)
+  void* gpoolConvOutBuf;      // Gpool conv output (full spatial: [B, gpoolC, H, W])
+  size_t gpoolConvOutBufBytes;
+  void* gpoolScratchBuf;      // Gpool pooling intermediates (mean, max, concat, bias)
+  size_t gpoolScratchBufBytes;
 
-  // Global pooling indices buffer (needed for AdaptiveMaxPool2d)
-  void* maxIndicesBuf;        // INT64 indices from max pooling  // Size tracking
+  // Size tracking
   size_t inputBufBytes;
   size_t inputGlobalBufBytes;
   size_t inputMetaBufBytes;
@@ -764,22 +765,23 @@ struct Buffers {
       maskBuf(nullptr),
       scratchBuf(nullptr),
       p1OutBuf(nullptr),
+      p1Out2Buf(nullptr),
       g1OutBuf(nullptr),
       g1Out2Buf(nullptr),
       g1ConcatBuf(nullptr),
-      g1ConcatFP16Buf(nullptr),
       g1BiasBuf(nullptr),
       p1PassBuf(nullptr),
       v1OutBuf(nullptr),
       v1Out2Buf(nullptr),
       v1MeanBuf(nullptr),
-      v1MeanFP16Buf(nullptr),
       v2OutBuf(nullptr),
       ownershipScratchBuf(nullptr),
-      valueScratchBuf(nullptr),
-      scoreValueScratchBuf(nullptr),
-      policyScratchBuf(nullptr),
-      policyPassScratchBuf(nullptr)
+      maskSumBuf(nullptr),
+      maskFloatBuf(nullptr),
+      gpoolConvOutBuf(nullptr),
+      gpoolScratchBuf(nullptr),
+      gpoolConvOutBufBytes(0),
+      gpoolScratchBufBytes(0)
   {
     size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
@@ -829,60 +831,82 @@ struct Buffers {
     trunkBuf = ascendMalloc(trunkBufBytes);
     maskBuf = ascendMalloc(maskBufBytes);
     scratchBuf = ascendMalloc(scratchBufBytes);
+    residualMidBuf = ascendMalloc(scratchBufBytes);  // Same size as trunk
 
     // Policy head intermediate buffers
+    // CRITICAL: Match CUDA buffer sizes exactly
     int p1Channels = m.policyHead.p1Conv.outChannels;
     int g1Channels = m.policyHead.g1Conv.outChannels;
-    p1OutBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    // p1Out: ALWAYS float-sized (CUDA comment: "Need to hold floats, not just halfs")
+    p1OutBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * nnXLen * nnYLen * sizeof(float));
+    // p1Out2: float buffer for FP16->FP32 conversion of p1Out before bias add (only in FP16 mode)
+    if(useFP16) {
+      p1Out2Buf = ascendMalloc((size_t)p1Channels * maxBatchSize * nnXLen * nnYLen * sizeof(float));
+    }
+    // g1Out, g1Out2: FP16 or FP32 depending on mode (g1Conv and g1BN use FP16)
     g1OutBuf = ascendMalloc((size_t)g1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
     g1Out2Buf = ascendMalloc((size_t)g1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    // g1Concat: ALWAYS float (global pooling always outputs float)
     g1ConcatBuf = ascendMalloc((size_t)g1Channels * 3 * maxBatchSize * sizeof(float));
+    // g1Bias: ALWAYS float (gpoolToBiasMul uses FP32)
     g1BiasBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * sizeof(float));
+    // p1PassBuf: ALWAYS float (gpoolToPassMul uses FP32)
     p1PassBuf = ascendMalloc((size_t)p1Channels * maxBatchSize * sizeof(float));
 
     // Value head intermediate buffers
+    // CRITICAL: Match CUDA buffer sizes exactly
     int v1Channels = m.valueHead.v1Conv.outChannels;
     int v2Channels = m.valueHead.v2Mul.outChannels;
     int ownershipChannels = m.valueHead.vOwnershipConv.outChannels;
     v1OutBuf = ascendMalloc((size_t)v1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
     v1Out2Buf = ascendMalloc((size_t)v1Channels * maxBatchSize * nnXLen * nnYLen * eltSize);
+    // v1Mean: ALWAYS float
     v1MeanBuf = ascendMalloc((size_t)v1Channels * 3 * maxBatchSize * sizeof(float));
+    // v2Out: ALWAYS float (v2Mul uses FP32)
     v2OutBuf = ascendMalloc((size_t)v2Channels * maxBatchSize * sizeof(float));
-    ownershipScratchBuf = ascendMalloc((size_t)ownershipChannels * maxBatchSize * nnXLen * nnYLen * eltSize);
-
-    // FP16 output scratch buffers (for FP16->FP32 conversion)
-    // These are only needed in FP16 mode to hold FP16 outputs before conversion
+    // ownershipScratchBuf: only needed in FP16 mode for conv output before FP32 conversion
     if(useFP16) {
-      valueScratchBuf = ascendMalloc(valueBufBytes / 2);  // FP16 is half size
-      scoreValueScratchBuf = ascendMalloc(scoreValueBufBytes / 2);
-      policyScratchBuf = ascendMalloc(policyBufBytes / 2);
-      policyPassScratchBuf = ascendMalloc(policyPassBufBytes / 2);
-    } else {
-      valueScratchBuf = nullptr;
-      scoreValueScratchBuf = nullptr;
-      policyScratchBuf = nullptr;
-      policyPassScratchBuf = nullptr;
+      ownershipScratchBuf = ascendMalloc((size_t)ownershipChannels * maxBatchSize * nnXLen * nnYLen * sizeof(aclFloat16));
     }
 
-    // FP16 intermediate buffers for global pooling results (needed for MatMulLayer in FP16 mode)
-    // Global pooling always outputs FP32, but MatMulLayer expects FP16 inputs when useFP16=true
-    if(useFP16) {
-      g1ConcatFP16Buf = ascendMalloc((size_t)g1Channels * 3 * maxBatchSize * sizeof(aclFloat16));
-      v1MeanFP16Buf = ascendMalloc((size_t)v1Channels * 3 * maxBatchSize * sizeof(aclFloat16));
-    } else {
-      g1ConcatFP16Buf = nullptr;
-      v1MeanFP16Buf = nullptr;
-    }
-
-    // Allocate maxIndices buffer for global pooling (int64 for indices from max pooling)
-    // Size: [max(g1Channels, valueHead.v1Conv.outChannels)] * batchSize
-    size_t maxIndicesSize = (size_t)max(g1Channels, m.valueHead.v1Conv.outChannels) * maxBatchSize;
-    maxIndicesBuf = ascendMalloc(maxIndicesSize * sizeof(int64_t));
+    // Mask buffers
+    maskBuf = ascendMalloc(maskBufBytes);
+    // maskFloatBuf: ALWAYS float (needed for BN operations and pooling)
+    maskFloatBuf = ascendMalloc((size_t)maxBatchSize * nnXLen * nnYLen * sizeof(float));
+    // maskSumBuf: ALWAYS float (count of valid board positions per batch)
+    maskSumBuf = ascendMalloc((size_t)maxBatchSize * sizeof(float));
 
     // Allocate workspace
     workspaceBytes = extraWorkspace;
     if(workspaceBytes > 0) {
       workspaceBuf = ascendMalloc(workspaceBytes);
+    }
+
+    // Allocate global pooling block buffers (if model has gpool blocks)
+    int maxGpoolChannels = 0;
+    int maxGpoolRegularChannels = 0;
+    for(const auto& blockPair : m.trunk.blocks) {
+      if(blockPair.first == GLOBAL_POOLING_BLOCK_KIND) {
+        const auto* desc = static_cast<const GlobalPoolingResidualBlockDesc*>(blockPair.second.get());
+        maxGpoolChannels = std::max(maxGpoolChannels, desc->gpoolConv.outChannels);
+        maxGpoolRegularChannels = std::max(maxGpoolRegularChannels, desc->regularConv.outChannels);
+      }
+    }
+    if(maxGpoolChannels > 0) {
+      // gpoolConvOutBuf: full spatial output of gpoolConv [B, gpoolC, H, W]
+      gpoolConvOutBufBytes = (size_t)maxBatchSize * maxGpoolChannels * nnXLen * nnYLen * eltSize;
+      gpoolConvOutBuf = ascendMalloc(gpoolConvOutBufBytes);
+
+      // gpoolScratchBuf: pooling intermediates + concat + bias
+      // Layout: mean(dtype) + meanFP32 + max(dtype) + maxFP32 + scaledMean(FP32)
+      //         + concat(FP32) + bias(FP32)
+      size_t poolElts = (size_t)maxBatchSize * maxGpoolChannels;
+      size_t pBytesDtype = poolElts * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
+      size_t pBytesFP32 = poolElts * sizeof(float);
+      gpoolScratchBufBytes = 2 * pBytesDtype + 5 * pBytesFP32
+                           + poolElts * 3 * sizeof(float)  // gpoolConcat
+                           + (size_t)maxBatchSize * maxGpoolRegularChannels * sizeof(float);  // gpoolBias
+      gpoolScratchBuf = ascendMalloc(gpoolScratchBufBytes);
     }
   }
 
@@ -903,7 +927,9 @@ struct Buffers {
     ascendFree(trunkBuf);
     ascendFree(maskBuf);
     ascendFree(scratchBuf);
+    ascendFree(residualMidBuf);
     ascendFree(p1OutBuf);
+    ascendFree(p1Out2Buf);
     ascendFree(g1OutBuf);
     ascendFree(g1Out2Buf);
     ascendFree(g1ConcatBuf);
@@ -914,16 +940,12 @@ struct Buffers {
     ascendFree(v1MeanBuf);
     ascendFree(v2OutBuf);
     ascendFree(ownershipScratchBuf);
-    // Free FP16 scratch buffers
-    ascendFree(valueScratchBuf);
-    ascendFree(scoreValueScratchBuf);
-    ascendFree(policyScratchBuf);
-    ascendFree(policyPassScratchBuf);
-    // Free FP16 global pooling intermediate buffers
-    ascendFree(g1ConcatFP16Buf);
-    ascendFree(v1MeanFP16Buf);
-    // Free maxIndices buffer
-    ascendFree(maxIndicesBuf);
+    // Free mask buffers
+    ascendFree(maskFloatBuf);
+    ascendFree(maskSumBuf);
+    // Free gpool block buffers
+    ascendFree(gpoolConvOutBuf);
+    ascendFree(gpoolScratchBuf);
   }
 
   Buffers() = delete;
@@ -1956,63 +1978,76 @@ struct ResidualBlock {
     int nnXLen,
     int nnYLen,
     const void* maskBuf,
-    void* inputBuf,
-    void* outputBuf,
-    void* scratchBuf,
+    void* trunkBuf,
+    void* trunkScratchBuf,
+    void* midBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // Copy input to scratch as residual backup
-    // We need to preserve the original input for the residual connection
-    size_t trunkBytes = numChannels * batchSize * nnXLen * nnYLen * sizeof(float);
-    ascendCopyD2D(scratchBuf, inputBuf, trunkBytes);  // scratch = input (save for residual)
+    // Match CUDA's ResidualBlock pattern exactly:
+    // Uses 3 separate buffers to avoid in-place convolution.
+    //
+    // CUDA flow (ResidualBlock):
+    //   midIn = Conv(BN(trunkBuf))        [normActConv1]
+    //   trunkBuf = Conv(BN(midIn)) + trunkBuf  [normActConv2 with accumulate]
+    //
+    // We avoid in-place operations by using trunkBuf, trunkScratchBuf, midBuf:
+    //   1. preBN: trunkBuf → trunkScratchBuf (trunkBuf PRESERVED)
+    //   2. preConv: trunkScratchBuf → midBuf
+    //   3. midBN: midBuf → trunkScratchBuf (midBuf PRESERVED)
+    //   4. midConv: trunkScratchBuf → midBuf
+    //   5. Residual add: midBuf + trunkBuf → trunkBuf
 
-    // Apply pre NormActConv: input -> input (in-place for BN part, then conv to output)
-    // But we need a separate buffer, so: input -> output
-    preNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, outputBuf, workspaceBuf, workspaceBytes);
+    // Step 1: preBN + preActivation: trunkBuf → trunkScratchBuf
+    preNormActConv->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
 
-    // Apply mid NormActConv: output -> output (in-place BN then conv)
-    midNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, outputBuf, outputBuf, workspaceBuf, workspaceBytes);
+    // Step 2: preConv: trunkScratchBuf → midBuf
+    preNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
 
-    // Add residual: output + scratch -> output
-    // This is the key step - add the saved residual to the transformed output
+    // Step 3: midBN + midActivation: midBuf → trunkScratchBuf
+    midNormActConv->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
+
+    // Step 4: midConv: trunkScratchBuf → midBuf
+    midNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+
+    // Step 5: Residual add: midBuf + trunkBuf → trunkBuf
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
-    // Create tensors for addition using cache
     vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
-    aclTensor* outputTensor = handle->tensorCache.get(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* residualTensor = handle->tensorCache.get(scratchBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* midTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
 
-    // Create output tensor for the result (same as outputTensor since in-place)
-    aclTensor* resultTensor = handle->tensorCache.get(outputBuf, addShape, dtype, ACL_FORMAT_NCHW);
-
-    // Phase 1: Get workspace size for add
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
 
-    aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, residualTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
 
-    // Phase 2: Execute add
     status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
+
+    (void)workspaceBytes;
   }
 };
 
 // GlobalPoolingResidualBlock - Residual block with global pooling branch
+// Matches CUDA implementation pattern from cudabackend.cpp
 struct GlobalPoolingResidualBlock {
   const string name;
-  unique_ptr<NormActConv> preNormActConv;
+  unique_ptr<BatchNormLayer> preBN;
+  unique_ptr<ConvLayer> regularConv;
   unique_ptr<ConvLayer> gpoolConv;
   unique_ptr<BatchNormLayer> gpoolBN;
   unique_ptr<MatMulLayer> gpoolToBiasMul;
-  unique_ptr<NormActConv> midNormActConv;
+  unique_ptr<NormActConv> normActConv2;
   int numChannels;
+  int regularChannels;
   int gpoolChannels;
   int nnXLen;
   int nnYLen;
@@ -2029,25 +2064,28 @@ struct GlobalPoolingResidualBlock {
     bool useFP16_
   ) : name(desc->name),
       numChannels(desc->finalConv.outChannels),
+      regularChannels(desc->regularConv.outChannels),
       gpoolChannels(desc->gpoolConv.outChannels),
       nnXLen(nnX),
       nnYLen(nnY),
       useFP16(useFP16_)
   {
-    preNormActConv = make_unique<NormActConv>(
-      &desc->preBN, &desc->preActivation, &desc->regularConv, nnX, nnY, useFP16_);
+    // preBN is applied to trunk (NOT part of NormActConv since regularConv is separate)
+    preBN = make_unique<BatchNormLayer>(&desc->preBN, &desc->preActivation, nnX, nnY, useFP16_);
+    regularConv = make_unique<ConvLayer>(&desc->regularConv, useFP16_);
     gpoolConv = make_unique<ConvLayer>(&desc->gpoolConv, useFP16_);
     gpoolBN = make_unique<BatchNormLayer>(&desc->gpoolBN, &desc->gpoolActivation, nnX, nnY, useFP16_);
-    gpoolToBiasMul = make_unique<MatMulLayer>(&desc->gpoolToBiasMul, useFP16_);
-    midNormActConv = make_unique<NormActConv>(
+    // CUDA: gpoolToBiasMul(cudaHandles,&desc->gpoolToBiasMul,false) - ALWAYS FP32
+    gpoolToBiasMul = make_unique<MatMulLayer>(&desc->gpoolToBiasMul, false);
+    normActConv2 = make_unique<NormActConv>(
       &desc->midBN, &desc->midActivation, &desc->finalConv, nnX, nnY, useFP16_);
   }
 
   size_t requiredWorkspaceBytes(int batchSize, aclrtStream stream) const {
     size_t bytes = 0;
-    bytes = max(bytes, preNormActConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    bytes = max(bytes, regularConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
     bytes = max(bytes, gpoolConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
-    bytes = max(bytes, midNormActConv->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+    bytes = max(bytes, normActConv2->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
     return bytes;
   }
 
@@ -2057,56 +2095,223 @@ struct GlobalPoolingResidualBlock {
     int batchSize,
     const void* maskBuf,
     const float* maskSumBuf,
-    void* inputBuf,
-    void* regularOutBuf,
-    void* gpoolOutBuf,
-    void* gpoolConcatBuf,
-    void* gpoolBiasBuf,
+    void* trunkBuf,
+    void* trunkScratchBuf,
+    void* midBuf,
+    void* gpoolConvOutBuf,
+    void* gpoolScratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // This block has two branches:
-    // 1. Main branch: input -> preBN -> regularConv -> regularOutBuf
-    // 2. Global pooling branch: input -> gpoolConv -> gpoolBN -> global pool -> concat -> matmul -> bias
+    // Match CUDA's GlobalPoolingResidualBlock pattern exactly:
+    // 1. preBN: trunkBuf -> trunkScratchBuf (preserves trunkBuf for residual)
+    // 2. TWO parallel convs from trunkScratchBuf:
+    //    a. regularConv: trunkScratchBuf -> midBuf (midBuf = regularOut)
+    //    b. gpoolConv: trunkScratchBuf -> gpoolConvOutBuf (separate buffer)
+    // 3. gpoolBN: gpoolConvOutBuf -> gpoolConvOutBuf (in-place)
+    // 4. Global pooling: gpoolConvOutBuf -> gpoolScratchBuf intermediates (ALWAYS FP32)
+    // 5. gpoolToBiasMul: gpoolConcat -> gpoolBias (FP32)
+    // 6. Add gpoolBias to regularOut (midBuf) (broadcast)
+    // 7. normActConv2 with residual: regularOut -> trunkBuf
+    //
+    // KEY: midBuf holds regularOut throughout. gpoolScratchBuf holds pooling intermediates.
+    // workspaceBuf is ONLY used for ACLNN operator workspace (never for data storage).
 
-    // Step 1: Apply pre NormActConv (preBN + preActivation + regularConv)
-    // input -> regularOutBuf
-    preNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, inputBuf, regularOutBuf, workspaceBuf, workspaceBytes);
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+    size_t poolElts = (size_t)batchSize * gpoolChannels;
+    size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : (poolElts * sizeof(float));
+    size_t poolBytesFP32 = poolElts * sizeof(float);
 
-    // Step 2: Apply gpoolConv on input -> gpoolOutBuf
-    gpoolConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
+    // Layout in gpoolScratchBuf:
+    //   [0..poolBytesDtype)                          = meanPool result
+    //   [poolBytesDtype..+poolBytesFP32)              = meanFP32
+    //   [+poolBytesFP32..+poolBytesDtype)             = maxPool result
+    //   [+poolBytesDtype..+poolBytesFP32)             = maxFP32
+    //   [+poolBytesFP32..+poolBytesFP32)              = scaledMean
+    //   [+poolBytesFP32..+3*poolBytesFP32)            = gpoolConcat
+    //   [+3*poolBytesFP32..+regularChannels*batch*4]  = gpoolBias
+    void* meanPoolBuf = gpoolScratchBuf;
+    void* meanFP32Buf = (char*)meanPoolBuf + poolBytesDtype;
+    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;
+    void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;
+    void* scaledMeanBuf = (char*)maxFP32Buf + poolBytesFP32;
+    void* gpoolConcatBuf = (char*)scaledMeanBuf + poolBytesFP32;
+    void* gpoolBiasBuf = (char*)gpoolConcatBuf + (size_t)gpoolChannels * 3 * batchSize * sizeof(float);
 
-    // Step 3: Apply gpoolBN on gpoolOutBuf (in-place)
-    gpoolBN->apply(handle, stream, batchSize, gpoolOutBuf, maskBuf, gpoolOutBuf, workspaceBuf, workspaceBytes);
+    // Step 1: preBN on trunk -> trunkScratchBuf (trunkBuf preserved for residual)
+    preBN->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
 
-    // Step 4: Global pooling (mean, max, mean * sqrt(area))
-    // For now, we'll use a simplified global average pooling
-    // Full implementation would need:
-    // - aclnnAdaptiveAvgPool2d for mean pooling to (1,1)
-    // - Custom kernel for max pooling
-    // - Concatenation of mean, mean * sqrt(area) - 14, max
+    // Step 2a: regularConv: trunkScratchBuf -> midBuf (midBuf = regularOut)
+    regularConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
 
-    // TODO: Implement proper global pooling with aclnnAdaptiveAvgPool2d
-    // For now, use a placeholder that copies zeros
-    (void)gpoolConcatBuf;
-    (void)maskSumBuf;
+    // Step 2b: gpoolConv: trunkScratchBuf -> gpoolConvOutBuf
+    // Uses separate buffer to avoid in-place convolution (CANN may not support it)
+    gpoolConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, gpoolConvOutBuf, workspaceBuf, workspaceBytes);
 
-    // Step 5: Apply gpoolToBiasMul to get bias for regular branch
-    // gpoolConcatBuf (batch, gpoolChannels*3) -> gpoolBiasBuf (batch, numChannels)
+    // Step 3: gpoolBN: gpoolConvOutBuf -> gpoolConvOutBuf (in-place BN is safe)
+    gpoolBN->apply(handle, stream, batchSize, gpoolConvOutBuf, maskBuf, gpoolConvOutBuf, workspaceBuf, workspaceBytes);
+
+    // Step 4: Global pooling on gpoolConvOutBuf -> intermediates in gpoolScratchBuf (ALWAYS FP32)
+    // Computes [mean, scaledMean, max] -> [batch, gpoolChannels * 3]
+    {
+      // 4a: Mean pooling
+      aclTensor* gpoolOutTensorND = handle->tensorCache.get(gpoolConvOutBuf, {batchSize, gpoolChannels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
+      aclTensor* meanPoolTensorND = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, dtype, ACL_FORMAT_ND);
+
+      aclIntArray* meanReduceDims = createAclIntArray({2, 3});
+      uint64_t meanWsSize = 0;
+      aclOpExecutor* meanExecutor = nullptr;
+      aclnnStatus status = aclnnMeanGetWorkspaceSize(gpoolOutTensorND, meanReduceDims, true, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
+      if(status == ACLNN_SUCCESS && meanWsSize <= workspaceBytes) {
+        status = aclnnMean(workspaceBuf, meanWsSize, meanExecutor, stream);
+      }
+      aclDestroyIntArray(meanReduceDims);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnMean failed for gpool block mean pooling: " + to_string(status));
+      }
+
+      // 4b: Cast mean to FP32 if needed
+      aclTensor* meanFP32Tensor;
+      if(useFP16) {
+        aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+        meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        uint64_t castWsSize = 0;
+        aclOpExecutor* castExecutor = nullptr;
+        status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
+        if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+          status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+        }
+        if(status != ACLNN_SUCCESS) {
+          throw StringError("aclnnCast failed for gpool mean FP16->FP32: " + to_string(status));
+        }
+      } else {
+        meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        meanFP32Buf = meanPoolBuf;
+      }
+
+      // 4c: Max pooling
+      aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, dtype, ACL_FORMAT_ND);
+      aclIntArray* reduceDims = createAclIntArray({2, 3});
+      uint64_t maxWsSize = 0;
+      aclOpExecutor* maxExecutor = nullptr;
+      status = aclnnAmaxGetWorkspaceSize(gpoolOutTensorND, reduceDims, true, maxPoolTensor, &maxWsSize, &maxExecutor);
+      if(status == ACLNN_SUCCESS && maxWsSize <= workspaceBytes) {
+        status = aclnnAmax(workspaceBuf, maxWsSize, maxExecutor, stream);
+      }
+      aclDestroyIntArray(reduceDims);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnAmax failed for gpool block max pooling: " + to_string(status));
+      }
+
+      // 4d: Cast max to FP32 if needed
+      aclTensor* maxFP32Tensor;
+      if(useFP16) {
+        aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+        maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        uint64_t castWsSize = 0;
+        aclOpExecutor* castExecutor = nullptr;
+        status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, maxFP32Tensor, &castWsSize, &castExecutor);
+        if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+          status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+        }
+        if(status != ACLNN_SUCCESS) {
+          throw StringError("aclnnCast failed for gpool max FP16->FP32: " + to_string(status));
+        }
+      } else {
+        maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        maxFP32Buf = maxPoolBuf;
+      }
+
+      // 4e: scaledMean = mean * (sqrt(area) - 14) * 0.1
+      float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
+      float scale = (sqrtArea - 14.0f) * 0.1f;
+      aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      {
+        aclScalar* scaleScalar = aclCreateScalar(&scale, ACL_FLOAT);
+        uint64_t mulsWsSize = 0;
+        aclOpExecutor* mulsExecutor = nullptr;
+        status = aclnnMulsGetWorkspaceSize(meanFP32Tensor, scaleScalar, scaledMeanTensor, &mulsWsSize, &mulsExecutor);
+        if(status == ACLNN_SUCCESS && mulsWsSize <= workspaceBytes) {
+          status = aclnnMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+        }
+        aclDestroyScalar(scaleScalar);
+        if(status != ACLNN_SUCCESS) {
+          throw StringError("aclnnMuls failed for gpool scaledMean: " + to_string(status));
+        }
+      }
+
+      // 4f: Concatenate [mean, scaledMean, max] -> gpoolConcatBuf (in gpoolScratchBuf, NOT midBuf)
+      // midBuf still holds regularOut at this point - do NOT overwrite it
+      aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels}, ACL_FLOAT, ACL_FORMAT_ND);
+      aclTensor* scaledMean2D = handle->tensorCache.get(scaledMeanBuf, {batchSize, gpoolChannels}, ACL_FLOAT, ACL_FORMAT_ND);
+      aclTensor* max2D = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels}, ACL_FLOAT, ACL_FORMAT_ND);
+
+      aclTensor* tensorsForCat[3] = {mean2D, scaledMean2D, max2D};
+      aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
+      if(!tensorList) {
+        throw StringError("aclCreateTensorList failed for gpool block concat");
+      }
+
+      aclTensor* concatOut = handle->tensorCache.get(gpoolConcatBuf, {batchSize, gpoolChannels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
+      uint64_t catWsSize = 0;
+      aclOpExecutor* catExecutor = nullptr;
+      status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);
+      if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
+        status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
+      }
+      aclDestroyTensorList(tensorList);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnCat failed for gpool block concat: " + to_string(status));
+      }
+    }
+
+    // Step 5: gpoolToBiasMul: gpoolConcat (FP32) -> gpoolBias (FP32, in gpoolScratchBuf)
     gpoolToBiasMul->apply(handle, stream, batchSize, gpoolConcatBuf, gpoolBiasBuf, workspaceBuf, workspaceBytes);
 
-    // Step 6: Add gpoolBias to regularOutBuf (broadcast bias across spatial dims)
-    // TODO: Implement aclnnAdd with proper broadcasting
-    // This adds the global pooling bias to each spatial location
+    // Step 6: Add gpoolBias to regularOut (midBuf) - broadcast across spatial dims
+    {
+      vector<int64_t> regularOutShape = {batchSize, regularChannels, nnYLen, nnXLen};
+      vector<int64_t> biasShape = {batchSize, regularChannels, 1, 1};
 
-    // Step 7: Apply mid NormActConv (midBN + midActivation + finalConv) with residual
-    // regularOutBuf -> inputBuf (output, with residual from original input)
-    midNormActConv->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, regularOutBuf, inputBuf, workspaceBuf, workspaceBytes);
+      aclTensor* regularOutTensor = handle->tensorCache.get(midBuf, regularOutShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* biasTensor = handle->tensorCache.get(gpoolBiasBuf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* resultTensor = handle->tensorCache.get(midBuf, regularOutShape, dtype, ACL_FORMAT_NCHW);
 
-    // Step 8: Add residual connection
-    // TODO: Implement residual add: inputBuf + scratchBuf -> inputBuf
-    // Note: The inputBuf should contain the original trunk features for residual
+      uint64_t addWsSize = 0;
+      aclOpExecutor* addExecutor = nullptr;
+      aclnnStatus addStatus = aclnnAddGetWorkspaceSize(regularOutTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+      if(addStatus == ACLNN_SUCCESS) {
+        addStatus = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+      }
+      if(addStatus != ACLNN_SUCCESS) {
+        throw StringError("aclnnAdd failed for gpool block bias add: " + to_string(addStatus));
+      }
+    }
 
+    // Step 7: normActConv2 with residual
+    // BN: midBuf -> trunkScratchBuf, Conv: trunkScratchBuf -> midBuf
+    normActConv2->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
+    normActConv2->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+
+    // Step 8: Residual add: midBuf + trunkBuf -> trunkBuf
+    {
+      vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
+      aclTensor* midOutTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+      aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+
+      uint64_t addWsSize = 0;
+      aclOpExecutor* addExecutor = nullptr;
+      aclnnStatus status = aclnnAddGetWorkspaceSize(midOutTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+      if(status == ACLNN_SUCCESS) {
+        status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+      }
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnAdd failed for GlobalPoolingResidualBlock " + name + " with error: " + to_string(status));
+      }
+    }
+
+    (void)maskSumBuf;
     (void)workspaceBytes;
   }
 };
@@ -2140,6 +2345,9 @@ struct Model {
   unique_ptr<BatchNormLayer> trunkTipBN;
   vector<unique_ptr<ResidualBlock>> residualBlocks;
   vector<unique_ptr<GlobalPoolingResidualBlock>> gpoolBlocks;
+
+  // Ordered block kinds - matches CUDA BlockStack iteration order
+  vector<int> trunkBlockKinds;
 
   // Policy head layers
   unique_ptr<ConvLayer> p1Conv;
@@ -2202,6 +2410,7 @@ private:
     void* inputMetaBuf,
     void* trunkOutputBuf,
     void* maskBuf,
+    float* maskSumBuf,
     void* scratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
@@ -2213,6 +2422,7 @@ private:
     int batchSize,
     const void* trunkOutputBuf,
     const void* maskBuf,
+    float* maskSumBuf,
     float* policyPassBuf,
     float* policyBuf,
     void* scratchBuf,
@@ -2227,6 +2437,7 @@ private:
     int batchSize,
     const void* trunkOutputBuf,
     const void* maskBuf,
+    float* maskSumBuf,
     float* valueBuf,
     float* scoreValueBuf,
     void* ownershipBuf,
@@ -2256,9 +2467,10 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   initialConv = make_unique<ConvLayer>(&desc.trunk.initialConv, fp16);
   initialMatMul = make_unique<MatMulLayer>(&desc.trunk.initialMatMul, fp16);
 
-  // Create residual blocks
+  // Create residual blocks in order
   for(const auto& blockPair : desc.trunk.blocks) {
     int blockKind = blockPair.first;
+    trunkBlockKinds.push_back(blockKind);
     if(blockKind == ORDINARY_BLOCK_KIND) {
       const ResidualBlockDesc* rdesc = static_cast<const ResidualBlockDesc*>(blockPair.second.get());
       residualBlocks.push_back(make_unique<ResidualBlock>(rdesc, nnX, nnY, fp16));
@@ -2272,25 +2484,38 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   trunkTipBN = make_unique<BatchNormLayer>(&desc.trunk.trunkTipBN, &desc.trunk.trunkTipActivation, nnX, nnY, fp16);
 
   // Create policy head layers
+  // CRITICAL: Match CUDA backend behavior exactly:
+  // - p1Conv and g1Conv use FP16 (they operate on trunk features)
+  // - g1BN uses FP16 (operates on g1Conv output)
+  // - gpoolToBiasMul, p1BN, p2Conv, gpoolToPassMul, gpoolToPassBias, gpoolToPassMul2
+  //   ALL use FP32 (useFP16=false) to match CUDA's numerical precision
+  // CUDA: gpoolToBiasMul(cudaHandles,&desc->gpoolToBiasMul,false)
+  // CUDA: p1BN(cudaHandles,...,fp16=false)
+  // CUDA: p2Conv(cudaHandles,&desc->p2Conv,fp16=false)
   p1Conv = make_unique<ConvLayer>(&desc.policyHead.p1Conv, fp16);
   g1Conv = make_unique<ConvLayer>(&desc.policyHead.g1Conv, fp16);
   g1BN = make_unique<BatchNormLayer>(&desc.policyHead.g1BN, &desc.policyHead.g1Activation, nnX, nnY, fp16);
-  gpoolToBiasMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToBiasMul, fp16);
-  p1BN = make_unique<BatchNormLayer>(&desc.policyHead.p1BN, &desc.policyHead.p1Activation, nnX, nnY, fp16);
-  p2Conv = make_unique<ConvLayer>(&desc.policyHead.p2Conv, fp16);
-  gpoolToPassMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul, fp16);
-  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, fp16);
-  gpoolToPassMul2 = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul2, fp16);
+  gpoolToBiasMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToBiasMul, false);  // ALWAYS FP32
+  p1BN = make_unique<BatchNormLayer>(&desc.policyHead.p1BN, &desc.policyHead.p1Activation, nnX, nnY, false);  // ALWAYS FP32
+  p2Conv = make_unique<ConvLayer>(&desc.policyHead.p2Conv, false);  // ALWAYS FP32
+  gpoolToPassMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul, false);  // ALWAYS FP32
+  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, false);  // ALWAYS FP32
+  gpoolToPassMul2 = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul2, false);  // ALWAYS FP32
 
   // Create value head layers
+  // CRITICAL: Match CUDA backend behavior exactly:
+  // - v1Conv and v1BN use FP16 (they operate on trunk features)
+  // - v2Mul, v2Bias, v3Mul, v3Bias, sv3Mul, sv3Bias ALL use FP32
+  // CUDA: v2Mul(cudaHandles,&desc->v2Mul,false)
+  // CUDA: v2Bias(cudaHandles,...,fp16=false)
   v1Conv = make_unique<ConvLayer>(&desc.valueHead.v1Conv, fp16);
   v1BN = make_unique<BatchNormLayer>(&desc.valueHead.v1BN, &desc.valueHead.v1Activation, nnX, nnY, fp16);
-  v2Mul = make_unique<MatMulLayer>(&desc.valueHead.v2Mul, fp16);
-  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, fp16);
-  v3Mul = make_unique<MatMulLayer>(&desc.valueHead.v3Mul, fp16);
-  v3Bias = make_unique<MatBiasLayer>(&desc.valueHead.v3Bias, fp16);
-  sv3Mul = make_unique<MatMulLayer>(&desc.valueHead.sv3Mul, fp16);
-  sv3Bias = make_unique<MatBiasLayer>(&desc.valueHead.sv3Bias, fp16);
+  v2Mul = make_unique<MatMulLayer>(&desc.valueHead.v2Mul, false);  // ALWAYS FP32
+  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, false);  // ALWAYS FP32
+  v3Mul = make_unique<MatMulLayer>(&desc.valueHead.v3Mul, false);  // ALWAYS FP32
+  v3Bias = make_unique<MatBiasLayer>(&desc.valueHead.v3Bias, false);  // ALWAYS FP32
+  sv3Mul = make_unique<MatMulLayer>(&desc.valueHead.sv3Mul, false);  // ALWAYS FP32
+  sv3Bias = make_unique<MatBiasLayer>(&desc.valueHead.sv3Bias, false);  // ALWAYS FP32
   vOwnershipConv = make_unique<ConvLayer>(&desc.valueHead.vOwnershipConv, fp16);
 
   // Create metadata encoder layers if present
@@ -2348,20 +2573,142 @@ void Model::apply(
   // Use pre-allocated intermediate buffers from Buffers struct
   void* trunkOutputBuf = buffers->trunkBuf;
   void* maskBuf = buffers->maskBuf;
+  float* maskSumBuf = (float*)buffers->maskSumBuf;
+  float* maskFloatBuf = (float*)buffers->maskFloatBuf;
   void* scratchBuf = buffers->scratchBuf;
   void* workspaceBuf = buffers->workspaceBuf;
   size_t workspaceBytes = buffers->workspaceBytes;
 
-  // Apply trunk
-  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  // ================================================================
+  // Step 1: Extract mask from input channel 0 and compute maskSum
+  // ================================================================
+  // The mask is stored in channel 0 of the input tensor.
+  // In NCHW layout: input[n, 0, h, w] = mask value (1.0 = valid, 0.0 = padding)
+  // maskSumBuf[n] = number of valid board positions for batch element n
+  {
+    aclDataType inputDtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+    // Create input tensor view restricted to channel 0
+    // We can use aclCreateTensor with offset to select channel 0
+    // For NCHW with shape [N, C, H, W], channel 0 starts at offset 0 with stride [C*H*W, H*W, W, 1]
+    // We want shape [N, 1, H, W] with the same data pointer and stride [C*H*W, H*W, W, 1]
+    int64_t cStride = nnXLen * nnYLen;
+    int64_t inputStride[4] = {cStride * numInputChannels, cStride, (int64_t)nnXLen, 1};
+    vector<int64_t> maskViewShape = {batchSize, 1, nnYLen, nnXLen};
 
-  // Apply policy head with pre-allocated buffers
-  applyPolicyHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
+    aclTensor* inputChannel0Tensor = aclCreateTensor(
+      maskViewShape.data(),                     // viewDims: [N, 1, H, W]
+      static_cast<uint64_t>(maskViewShape.size()), // viewDimsNum
+      inputDtype,                               // dataType
+      inputStride,                              // strides (same as full input)
+      static_cast<int64_t>(0),                  // storageOffset
+      ACL_FORMAT_NCHW,                          // format
+      maskViewShape.data(),                     // storageDims
+      static_cast<uint64_t>(maskViewShape.size()), // storageDimsNum
+      inputBuf                                  // data (same as full input)
+    );
 
-  // Apply value head with pre-allocated buffers
-  applyValueHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
+    // Copy channel 0 to maskBuf (same dtype as input)
+    size_t maskBytes = (size_t)batchSize * nnYLen * nnXLen * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
+    aclTensor* maskTensor = createAclTensor(maskBuf, maskViewShape, inputDtype, ACL_FORMAT_NCHW);
 
-  (void)requireExactNNLen;
+    uint64_t copyWsSize = 0;
+    aclOpExecutor* copyExecutor = nullptr;
+    aclnnStatus status = aclnnCopyGetWorkspaceSize(inputChannel0Tensor, maskTensor, &copyWsSize, &copyExecutor);
+    if(status == ACLNN_SUCCESS) {
+      status = aclnnCopy(workspaceBuf, copyWsSize, copyExecutor, stream);
+    }
+    aclDestroyTensor(inputChannel0Tensor);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnCopy failed for mask extraction: " + to_string(status));
+    }
+
+    // If requireExactNNLen, set maskBuf to NULL to skip masking in BN layers
+    // (global pooling still needs maskSumBuf for normalization)
+    if(requireExactNNLen) {
+      maskBuf = nullptr;
+    }
+
+    // Compute maskSum: sum mask values across spatial dims for each batch element
+    // maskFloatBuf is always float
+    if(useFP16) {
+      // Cast mask from FP16 to FP32
+      aclTensor* maskFP16Tensor = createAclTensor(maskBuf, maskViewShape, ACL_FLOAT16, ACL_FORMAT_NCHW);
+      aclTensor* maskFP32Tensor = createAclTensor(maskFloatBuf, maskViewShape, ACL_FLOAT, ACL_FORMAT_NCHW);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      status = aclnnCastGetWorkspaceSize(maskFP16Tensor, ACL_FLOAT, maskFP32Tensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS) {
+        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+      aclDestroyTensor(maskFP16Tensor);
+      aclDestroyTensor(maskFP32Tensor);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnCast failed for mask FP16->FP32: " + to_string(status));
+      }
+    } else {
+      // In FP32 mode, maskBuf and maskFloatBuf share the same data
+      maskFloatBuf = (float*)maskBuf;
+    }
+
+    // Sum across spatial dimensions: [N, 1, H, W] -> [N, 1]
+    // Use aclnnMean with multiplication by area to get sum
+    // Or use aclnnSum with reduction
+    aclTensor* maskSumInputTensor = createAclTensor(
+      maskFloatBuf, {batchSize, 1, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclTensor* maskSumOutputTensor = createAclTensor(
+      maskSumBuf, {batchSize, 1}, ACL_FLOAT, ACL_FORMAT_ND);
+    aclIntArray* sumReduceDims = createAclIntArray({2, 3});
+    bool sumKeepDim = true;
+
+    uint64_t sumWsSize = 0;
+    aclOpExecutor* sumExecutor = nullptr;
+    // Use aclnnMean then multiply by area to get sum (since aclnnSum may not exist)
+    // Actually, let's use aclnnMean and multiply by HW
+    aclTensor* meanOutput = createAclTensor(
+      maskSumBuf, {batchSize, 1, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
+    status = aclnnMeanGetWorkspaceSize(maskSumInputTensor, sumReduceDims, sumKeepDim, ACL_FLOAT, meanOutput, &sumWsSize, &sumExecutor);
+    if(status == ACLNN_SUCCESS) {
+      status = aclnnMean(workspaceBuf, sumWsSize, sumExecutor, stream);
+    }
+    aclDestroyIntArray(sumReduceDims);
+    aclDestroyTensor(maskSumInputTensor);
+    aclDestroyTensor(maskSumOutputTensor);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnMean failed for mask sum: " + to_string(status));
+    }
+
+    // maskSum = mean * H * W
+    float area = (float)(nnXLen * nnYLen);
+    aclScalar* areaScalar = createFloatScalar(area);
+    aclTensor* maskSumTensor = createAclTensor(maskSumBuf, {batchSize, 1, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    uint64_t mulsWsSize = 0;
+    aclOpExecutor* mulsExecutor = nullptr;
+    status = aclnnInplaceMulsGetWorkspaceSize(maskSumTensor, areaScalar, &mulsWsSize, &mulsExecutor);
+    if(status == ACLNN_SUCCESS) {
+      status = aclnnInplaceMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+    }
+    aclDestroyScalar(areaScalar);
+    aclDestroyTensor(maskSumTensor);
+    aclDestroyTensor(meanOutput);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnInplaceMuls failed for mask sum scaling: " + to_string(status));
+    }
+  }
+
+  // ================================================================
+  // Step 2: Apply trunk
+  // ================================================================
+  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, maskSumBuf, scratchBuf, workspaceBuf, workspaceBytes);
+
+  // ================================================================
+  // Step 3: Apply policy head
+  // ================================================================
+  applyPolicyHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, maskSumBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
+
+  // ================================================================
+  // Step 4: Apply value head
+  // ================================================================
+  applyValueHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, maskSumBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
 }
 
 void Model::applyTrunk(
@@ -2373,52 +2720,43 @@ void Model::applyTrunk(
   void* inputMetaBuf,
   void* trunkOutputBuf,
   void* maskBuf,
+  float* maskSumBuf,
   void* scratchBuf,
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
-  // Apply initial convolution: input -> trunkOutput
-  initialConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
-
-  // Apply initial matmul with global features
-  // This adds the global features (and optional metadata features) to trunkOutput
-  // The global features are broadcast and added to each spatial location
-  // KataGo: trunkOutput += inputGlobalBuf @ initialMatMul
-
-  // Allocate temporary buffer for matmul result
-  void* globalMulBuf = scratchBuf;  // Reuse scratch buffer for intermediate result
-
-  // Apply matmul: (batch, numGlobalChannels) @ (numGlobalChannels, trunkChannels) -> (batch, trunkChannels)
-  initialMatMul->apply(handle, stream, batchSize, inputGlobalBuf, globalMulBuf, workspaceBuf, workspaceBytes);
-
-  // Add globalMulBuf to each spatial location of trunkOutput
-  // trunkOutput is (batch, trunkChannels, nnYLen, nnXLen)
-  // globalMulBuf is (batch, trunkChannels)
-  // Need to broadcast add: trunkOutput += globalMulBuf[:, :, None, None]
-
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
-  // Create tensors for add with broadcasting using cache
-  vector<int64_t> trunkShape = {batchSize, trunkNumChannels, nnYLen, nnXLen};
-  vector<int64_t> biasShape = {batchSize, trunkNumChannels, 1, 1};  // Broadcast to NCHW
+  // Match CUDA trunk flow:
+  // 1. initialConv -> scratchBuf (not trunkOutputBuf!)
+  // 2. initialMatMul -> trunkOutputBuf, broadcast-add into scratchBuf
+  // 3. Residual blocks ping-pong between trunkOutputBuf and scratchBuf
+  // 4. trunkTipBN: scratchBuf -> trunkOutputBuf
 
-  aclTensor* trunkTensor = handle->tensorCache.get(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
-  aclTensor* biasTensor = handle->tensorCache.get(globalMulBuf, biasShape, dtype, ACL_FORMAT_NCHW);
-  aclTensor* resultTensor = handle->tensorCache.get(trunkOutputBuf, trunkShape, dtype, ACL_FORMAT_NCHW);
+  // Step 1: Initial conv -> scratchBuf
+  initialConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
-  // Phase 1: Get workspace size for add
-  uint64_t addWsSize = 0;
-  aclOpExecutor* addExecutor = nullptr;
+  // Step 2: Initial matmul -> trunkOutputBuf
+  initialMatMul->apply(handle, stream, batchSize, inputGlobalBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 
-  aclnnStatus status = aclnnAddGetWorkspaceSize(trunkTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+  // Broadcast-add: scratchBuf += trunkOutputBuf reshaped as (N, C, 1, 1)
+  {
+    vector<int64_t> scratchShape = {batchSize, trunkNumChannels, nnYLen, nnXLen};
+    vector<int64_t> biasShape = {batchSize, trunkNumChannels, 1, 1};
 
-  if(status == ACLNN_SUCCESS) {
-    // Phase 2: Execute add
-    status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
-  }
+    aclTensor* scratchTensor = handle->tensorCache.get(scratchBuf, scratchShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* biasTensor = handle->tensorCache.get(trunkOutputBuf, biasShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* resultTensor = handle->tensorCache.get(scratchBuf, scratchShape, dtype, ACL_FORMAT_NCHW);
 
-  if(status != ACLNN_SUCCESS) {
-    throw StringError("aclnnAdd failed for initial global features with error: " + to_string(status));
+    uint64_t addWsSize = 0;
+    aclOpExecutor* addExecutor = nullptr;
+    aclnnStatus status = aclnnAddGetWorkspaceSize(scratchTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    if(status == ACLNN_SUCCESS) {
+      status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+    }
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAdd failed for initial global features: " + to_string(status));
+    }
   }
 
   // TODO: Handle metadata features if present
@@ -2430,24 +2768,39 @@ void Model::applyTrunk(
   (void)metaBias2;
   (void)metaMul3;
 
-  // Extract mask from input channel 0
-  // The mask is stored in the first channel of the input
-  // TODO: Implement mask extraction using aclnn indexing or stride
-  (void)maskBuf;
-
-  // Apply residual blocks
-  for(const auto& block : residualBlocks) {
-    block->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf, trunkOutputBuf, trunkOutputBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  // Step 3: Trunk blocks (Residual + GlobalPooling) - iterated in model order
+  // Match CUDA's BlockStack: iterate blocks in their original order,
+  // using per-type indices since blocks are stored in separate vectors.
+  {
+    int regularIdx = 0;
+    int gpoolIdx = 0;
+    for(int i = 0; i < (int)trunkBlockKinds.size(); i++) {
+      switch(trunkBlockKinds[i]) {
+      case ORDINARY_BLOCK_KIND:
+        residualBlocks[regularIdx]->apply(
+          handle, stream, batchSize, nnXLen, nnYLen, maskBuf,
+          scratchBuf, trunkOutputBuf, buffers->residualMidBuf,
+          workspaceBuf, workspaceBytes);
+        regularIdx++;
+        break;
+      case GLOBAL_POOLING_BLOCK_KIND:
+        gpoolBlocks[gpoolIdx]->apply(
+          handle, stream, batchSize, maskBuf, maskSumBuf,
+          scratchBuf, trunkOutputBuf, buffers->residualMidBuf,
+          buffers->gpoolConvOutBuf, buffers->gpoolScratchBuf,
+          workspaceBuf, workspaceBytes);
+        gpoolIdx++;
+        break;
+      case NESTED_BOTTLENECK_BLOCK_KIND:
+        throw StringError("NestedBottleneckResidualBlock not yet implemented in Ascend backend");
+      default:
+        throw StringError("Unknown trunk block kind: " + to_string(trunkBlockKinds[i]));
+      }
+    }
   }
 
-  // Apply global pooling residual blocks
-  // These require mask sum buffer for proper global pooling
-  // TODO: Implement gpoolBlocks with maskSumBuf
-
-  // Apply trunk tip BN
-  trunkTipBN->apply(handle, stream, batchSize, trunkOutputBuf, maskBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
-
-  (void)scratchBuf;
+  // Step 4: Trunk tip BN: scratchBuf -> trunkOutputBuf
+  trunkTipBN->apply(handle, stream, batchSize, scratchBuf, maskBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
 }
 
 void Model::applyPolicyHead(
@@ -2456,6 +2809,7 @@ void Model::applyPolicyHead(
   int batchSize,
   const void* trunkOutputBuf,
   const void* maskBuf,
+  float* maskSumBuf,
   float* policyPassBuf,
   float* policyBuf,
   void* scratchBuf,
@@ -2463,23 +2817,52 @@ void Model::applyPolicyHead(
   size_t workspaceBytes,
   Buffers* buffers
 ) const {
+  // Match CUDA policy head exactly:
+  // 1. p1Conv: trunk -> p1Out (FP16 or FP32)
+  // 2. g1Conv: trunk -> g1Out (FP16 or FP32)
+  // 3. g1BN: g1Out -> g1Out2 (FP16 or FP32)
+  // 4. Global pooling: g1Out2 -> g1Concat (ALWAYS FP32)
+  // 5. gpoolToBiasMul: g1Concat -> g1Bias (ALWAYS FP32)
+  // 6. Convert p1Out to FP32 if needed, add g1Bias (ALWAYS FP32)
+  // 7. p1BN: FP32 -> scratch (ALWAYS FP32)
+  // 8. p2Conv: scratch -> policyBuf (ALWAYS FP32)
+  // 9. gpoolToPassMul/PassBias/PassMul2 -> policyPassBuf (ALWAYS FP32)
+
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int p1Channels = p1Conv->outChannels;
   int g1Channels = g1Conv->outChannels;
-  (void)g1Channels;  // Used for buffer sizing which is pre-allocated
 
-  // Use pre-allocated intermediate buffers from Buffers struct
-  void* p1OutBuf = buffers->p1OutBuf;
+  void* p1OutBuf = buffers->p1OutBuf;          // ALWAYS float-sized
   void* g1OutBuf = buffers->g1OutBuf;
   void* g1Out2Buf = buffers->g1Out2Buf;
-  void* g1ConcatBuf = buffers->g1ConcatBuf;
-  void* g1BiasBuf = buffers->g1BiasBuf;
-  void* p1PassBuf = buffers->p1PassBuf;
-  void* policyScratchBuf = buffers->policyScratchBuf;
-  void* policyPassScratchBuf = buffers->policyPassScratchBuf;
+  void* g1ConcatBuf = buffers->g1ConcatBuf;    // ALWAYS float
+  void* g1BiasBuf = buffers->g1BiasBuf;        // ALWAYS float
+  void* p1PassBuf = buffers->p1PassBuf;        // ALWAYS float
+
+  (void)maskSumBuf;  // TODO: Use for mask-aware pooling
 
   // Step 1: Apply p1Conv: trunk -> p1Out
-  p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
+  if(useFP16) {
+    // p1Conv outputs FP16, p1OutBuf is float-sized, so we need FP16->FP32 conversion
+    // Actually, CUDA stores p1Out in FP16 first then converts. Let's do the same.
+    // p1Conv -> scratchBuf (FP16), then convert scratchBuf -> p1OutBuf (FP32)
+    p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
+    // Convert FP16 -> FP32
+    aclTensor* srcTensor = handle->tensorCache.get(scratchBuf, {batchSize, p1Channels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+    aclTensor* dstTensor = handle->tensorCache.get(p1OutBuf, {batchSize, p1Channels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    uint64_t castWsSize = 0;
+    aclOpExecutor* castExecutor = nullptr;
+    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
+    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnCast failed for p1Conv FP16->FP32: " + to_string(status));
+    }
+  } else {
+    p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
+  }
+  // Now p1OutBuf always contains FP32 data
 
   // Step 2: Apply g1Conv: trunk -> g1Out
   g1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), g1OutBuf, workspaceBuf, workspaceBytes);
@@ -2487,74 +2870,73 @@ void Model::applyPolicyHead(
   // Step 3: Apply g1BN: g1Out -> g1Out2
   g1BN->apply(handle, stream, batchSize, g1OutBuf, maskBuf, g1Out2Buf, workspaceBuf, workspaceBytes);
 
-  // Step 4: Global pooling on g1Out2 -> g1Concat
-  // This computes: mean, scaledMean, max and concatenates them
-  // Output format per CUDA: [mean, scaledMean, max] -> [batch, g1Channels * 3]
-  // where scaledMean = mean * (sqrt(area) - 14) * 0.1
+  // Step 4: Global pooling on g1Out2 -> g1Concat (ALWAYS FP32)
+  // Computes: [mean, scaledMean, max] -> [batch, g1Channels * 3]
   {
-    // Note: maxIndicesBuf from buffers is no longer used since we switched from
-    // aclnnAdaptiveMaxPool2d to aclnnAmax which doesn't require index output
-    aclIntArray* outputSize = createAclIntArray({1, 1});
-
-    // Use scratchBuf for intermediate pooling results
-    // In FP16 mode: [meanFP16][meanFP32][maxFP16][maxFP32][scaledMeanFP32]
-    // In FP32 mode: [meanFP32][maxFP32][scaledMeanFP32] (no separate cast buffers needed)
-    size_t poolElts = (size_t)batchSize * g1Channels;  // Elements for [batch, channels, 1, 1]
+    size_t poolElts = (size_t)batchSize * g1Channels;
     size_t poolBytesFP32 = poolElts * sizeof(float);
     size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : poolBytesFP32;
 
-    // Mean pool: output to first part of scratchBuf (FP16/FP32 matching input)
-    void* meanPoolBuf = scratchBuf;  // [batch, g1Channels, 1, 1] in input dtype
-    // FP32 mean buffer (for concatenation): comes after meanPoolBuf
-    void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32
+    // Use scratchBuf for intermediate pooling results
+    void* meanPoolBuf = scratchBuf;
+    void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;
+    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;
+    void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;
+    void* scaledMeanBuf = (char*)maxFP32Buf + poolBytesFP32;
 
-    // 4a: Mean pooling using aclnnMean (reduce along H and W dimensions)
-    // Use ACL_FORMAT_ND for aclnnMean per API requirements
+    // 4a: Mean pooling (FP16 input -> FP16/FP32 output)
     aclTensor* g1Out2TensorND = handle->tensorCache.get(g1Out2Buf, {batchSize, g1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
     aclTensor* meanPoolTensorND = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
 
     aclIntArray* meanReduceDims = createAclIntArray({2, 3});
-    bool meanKeepDim = true;
-
     uint64_t meanWsSize = 0;
     aclOpExecutor* meanExecutor = nullptr;
-    aclnnStatus status = aclnnMeanGetWorkspaceSize(g1Out2TensorND, meanReduceDims, meanKeepDim, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
+    aclnnStatus status = aclnnMeanGetWorkspaceSize(g1Out2TensorND, meanReduceDims, true, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
     if(status == ACLNN_SUCCESS && meanWsSize <= workspaceBytes) {
       status = aclnnMean(workspaceBuf, meanWsSize, meanExecutor, stream);
     }
     aclDestroyIntArray(meanReduceDims);
     if(status != ACLNN_SUCCESS) {
-      aclDestroyIntArray(outputSize);
       throw StringError("aclnnMean failed for policy head mean pooling: " + to_string(status));
     }
 
-    // 4b: Max pooling using aclnnAmax (reduce max along H and W dimensions)
-    // Output max after meanFP32Buf, using dtype (same as input for dtype matching)
-    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in dtype
-    void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;  // [batch, g1Channels, 1, 1] in FP32 (for concat)
-    // Use ACL_FORMAT_ND for amax operation per API requirements
-    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
-    // Create dim array for reducing along H (dim 2) and W (dim 3)
-    aclIntArray* reduceDims = createAclIntArray({2, 3});
-    bool keepDim = true;
+    // Cast mean to FP32 if needed
+    aclTensor* meanFP32Tensor;
+    if(useFP16) {
+      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      uint64_t castWsSize = 0;
+      aclOpExecutor* castExecutor = nullptr;
+      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
+      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
+        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      }
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnCast failed for policy mean FP16->FP32: " + to_string(status));
+      }
+    } else {
+      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      meanFP32Buf = meanPoolBuf;
+    }
 
+    // 4b: Max pooling
+    aclTensor* maxPoolTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
+    aclIntArray* reduceDims = createAclIntArray({2, 3});
     uint64_t maxWsSize = 0;
     aclOpExecutor* maxExecutor = nullptr;
-    status = aclnnAmaxGetWorkspaceSize(g1Out2TensorND, reduceDims, keepDim, maxPoolTensor, &maxWsSize, &maxExecutor);
+    status = aclnnAmaxGetWorkspaceSize(g1Out2TensorND, reduceDims, true, maxPoolTensor, &maxWsSize, &maxExecutor);
     if(status == ACLNN_SUCCESS && maxWsSize <= workspaceBytes) {
       status = aclnnAmax(workspaceBuf, maxWsSize, maxExecutor, stream);
     }
     aclDestroyIntArray(reduceDims);
     if(status != ACLNN_SUCCESS) {
-      aclDestroyIntArray(outputSize);
       throw StringError("aclnnAmax failed for policy head max pooling: " + to_string(status));
     }
 
-    // 4c: Cast max to FP32 if needed (for concatenation)
-    // In FP32 mode, maxPoolBuf == maxFP32Buf so we can skip the cast
+    // Cast max to FP32 if needed
     aclTensor* maxFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
+      aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
       maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
@@ -2563,46 +2945,17 @@ void Model::applyPolicyHead(
         status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
       }
       if(status != ACLNN_SUCCESS) {
-        aclDestroyIntArray(outputSize);
-        throw StringError("aclnnCast failed for policy head max pooling: " + to_string(status));
+        throw StringError("aclnnCast failed for policy max FP16->FP32: " + to_string(status));
       }
     } else {
-      // In FP32 mode, maxPoolBuf is already FP32
       maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
       maxFP32Buf = maxPoolBuf;
     }
 
-    // 4d: Cast mean to FP32 if needed (for scaledMean computation and concatenation)
-    // In FP32 mode, meanPoolBuf == meanFP32Buf so we can skip the cast
-    aclTensor* meanFP32Tensor;
-    if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, dtype, ACL_FORMAT_NCHW);
-      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-      if(status != ACLNN_SUCCESS) {
-        aclDestroyIntArray(outputSize);
-        throw StringError("aclnnCast failed for policy head mean pooling: " + to_string(status));
-      }
-    } else {
-      // In FP32 mode, meanPoolBuf is already FP32
-      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-      // meanFP32Buf points to same location as meanPoolBuf
-      meanFP32Buf = meanPoolBuf;
-    }
-
-    // 4e: Compute scaledMean = mean * (sqrt(area) - 14) * 0.1
+    // 4c: scaledMean = mean * (sqrt(area) - 14) * 0.1
     float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
     float scale = (sqrtArea - 14.0f) * 0.1f;
-
-    // scaledMean output after maxFP32Buf
-    void* scaledMeanBuf = (char*)maxFP32Buf + poolBytesFP32;  // [batch, g1Channels, 1, 1] in FP32
     aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
-
     {
       aclScalar* scaleScalar = aclCreateScalar(&scale, ACL_FLOAT);
       uint64_t mulsWsSize = 0;
@@ -2613,141 +2966,74 @@ void Model::applyPolicyHead(
       }
       aclDestroyScalar(scaleScalar);
       if(status != ACLNN_SUCCESS) {
-        aclDestroyIntArray(outputSize);
-        throw StringError("aclnnMuls failed for policy head scaledMean: " + to_string(status));
+        throw StringError("aclnnMuls failed for policy scaledMean: " + to_string(status));
       }
     }
 
-    // 4f: Concatenate [mean, scaledMean, max] along channel dimension
-    // Reshape each [batch, channels, 1, 1] to [batch, channels] for concatenation
-    // Then concatenate along dim=1 to get [batch, channels*3]
-
+    // 4d: Concatenate [mean, scaledMean, max] -> g1Concat (FP32)
     aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor* scaledMean2D = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor* max2D = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
 
-    // Create tensor array for concatenation: [mean, scaledMean, max]
     aclTensor* tensorsForCat[3] = {mean2D, scaledMean2D, max2D};
     aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
     if(!tensorList) {
-      aclDestroyIntArray(outputSize);
-      throw StringError("aclCreateTensorList failed for policy head global pooling concat");
+      throw StringError("aclCreateTensorList failed for policy head concat");
     }
 
-    // Output tensor for concat: [batch, g1Channels * 3]
     aclTensor* concatOut = handle->tensorCache.get(g1ConcatBuf, {batchSize, g1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
-
     uint64_t catWsSize = 0;
     aclOpExecutor* catExecutor = nullptr;
-    status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);  // dim=1 (channel dim)
+    status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);
     if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
       status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
     }
     aclDestroyTensorList(tensorList);
     if(status != ACLNN_SUCCESS) {
-      aclDestroyIntArray(outputSize);
-      throw StringError("aclnnCat failed for policy head global pooling concat: " + to_string(status));
+      throw StringError("aclnnCat failed for policy head concat: " + to_string(status));
     }
-
-    aclDestroyIntArray(outputSize);
   }
 
-  // Step 5: Apply gpoolToBiasMul: g1Concat -> g1Bias
-  // CRITICAL: In FP16 mode, g1ConcatBuf contains FP32 data from global pooling.
-  // MatMulLayer expects FP16 input, so we must convert FP32->FP16 first.
-  void* g1ConcatInputBuf;  // Buffer to pass to MatMulLayer
-  if(useFP16) {
-    // Cast g1ConcatBuf (FP32) -> g1ConcatFP16Buf (FP16)
-    aclTensor* srcTensor = handle->tensorCache.get(g1ConcatBuf, {batchSize, g1Channels*3}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* dstTensor = handle->tensorCache.get(buffers->g1ConcatFP16Buf, {batchSize, g1Channels*3}, ACL_FLOAT16, ACL_FORMAT_ND);
-    uint64_t castWsSize = 0;
-    aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
-    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-    }
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCast failed for policy head g1Concat FP32->FP16: " + to_string(status));
-    }
-    g1ConcatInputBuf = buffers->g1ConcatFP16Buf;
-  } else {
-    g1ConcatInputBuf = g1ConcatBuf;
-  }
-  gpoolToBiasMul->apply(handle, stream, batchSize, g1ConcatInputBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
+  // Step 5: gpoolToBiasMul: g1Concat (FP32) -> g1Bias (FP32)
+  // gpoolToBiasMul is constructed with useFP16=false, so it does FP32 matmul
+  gpoolToBiasMul->apply(handle, stream, batchSize, g1ConcatBuf, g1BiasBuf, workspaceBuf, workspaceBytes);
 
-  // Step 6: Add g1Bias to p1Out (broadcast across spatial dims)
-  // g1Bias is (batch, p1Channels, 1, 1), p1Out is (batch, p1Channels, nnYLen, nnXLen)
+  // Step 6: Add g1Bias (FP32) to p1Out (FP32) - broadcast across spatial dims
   {
     vector<int64_t> p1OutShape = {batchSize, p1Channels, nnYLen, nnXLen};
-    vector<int64_t> biasShape = {batchSize, p1Channels, 1, 1};  // Broadcast to NCHW
+    vector<int64_t> biasShape = {batchSize, p1Channels, 1, 1};
 
-    aclTensor* p1OutTensor = handle->tensorCache.get(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* p1OutTensor = handle->tensorCache.get(p1OutBuf, p1OutShape, ACL_FLOAT, ACL_FORMAT_NCHW);
     aclTensor* biasTensor = handle->tensorCache.get(g1BiasBuf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
-    aclTensor* resultTensor = handle->tensorCache.get(p1OutBuf, p1OutShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* resultTensor = handle->tensorCache.get(p1OutBuf, p1OutShape, ACL_FLOAT, ACL_FORMAT_NCHW);
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
     aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
     if(status == ACLNN_SUCCESS && addWsSize <= workspaceBytes) {
-      aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+      status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
     }
-
     if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnAdd failed for policy head bias with error: " + to_string(status));
+      throw StringError("aclnnAdd failed for policy head bias: " + to_string(status));
     }
   }
 
-  // Step 7: Apply p1BN: p1Out -> scratchBuf
+  // Step 7: p1BN: p1Out (FP32) -> scratchBuf (FP32)
+  // p1BN is constructed with useFP16=false, so it does FP32 BN
   p1BN->apply(handle, stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
-  // Step 8: Apply p2Conv: scratchBuf -> policyBuf
-  // In FP16 mode, output to scratch buffer first, then convert to FP32
-  if(useFP16) {
-    p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyScratchBuf, workspaceBuf, workspaceBytes);
-    // Convert FP16 to FP32 for final output
-    aclTensor* srcTensor = handle->tensorCache.get(policyScratchBuf, {batchSize, numPolicyChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-    aclTensor* dstTensor = handle->tensorCache.get(policyBuf, {batchSize, numPolicyChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
-    uint64_t castWsSize = 0;
-    aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
-    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-    }
-  } else {
-    p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
-  }
+  // Step 8: p2Conv: scratchBuf (FP32) -> policyBuf (FP32)
+  // p2Conv is constructed with useFP16=false
+  p2Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, scratchBuf, policyBuf, workspaceBuf, workspaceBytes);
 
-  // Step 9: Compute policy pass logit
-  // gpoolToPassMul: g1Concat -> p1PassBuf
-  // gpoolToPassBias: p1PassBuf (in-place)
-  // gpoolToPassMul2: p1PassBuf -> policyPassBuf (if modelVersion >= 15)
-  // CRITICAL: Use FP16 buffer when in FP16 mode (same as Step 5)
-  void* g1ConcatPassBuf = useFP16 ? buffers->g1ConcatFP16Buf : g1ConcatBuf;
-  if(useFP16) {
-    if(modelVersion >= 15) {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-      gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-      gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
-    } else {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, policyPassScratchBuf, workspaceBuf, workspaceBytes);
-    }
-    // Convert FP16 to FP32 for final output
-    aclTensor* srcTensor = handle->tensorCache.get(policyPassScratchBuf, {batchSize, numPolicyChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
-    aclTensor* dstTensor = handle->tensorCache.get(policyPassBuf, {batchSize, numPolicyChannels}, ACL_FLOAT, ACL_FORMAT_ND);
-    uint64_t castWsSize = 0;
-    aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
-    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-    }
+  // Step 9: Policy pass logit (ALWAYS FP32)
+  // gpoolToPassMul, gpoolToPassBias, gpoolToPassMul2 all useFP16=false
+  if(modelVersion >= 15) {
+    gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   } else {
-    if(modelVersion >= 15) {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-      gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-      gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
-    } else {
-      gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatPassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
-    }
+    gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   }
 
   (void)dtype;
@@ -2759,6 +3045,7 @@ void Model::applyValueHead(
   int batchSize,
   const void* trunkOutputBuf,
   const void* maskBuf,
+  float* maskSumBuf,
   float* valueBuf,
   float* scoreValueBuf,
   void* ownershipBuf,
@@ -2767,18 +3054,28 @@ void Model::applyValueHead(
   size_t workspaceBytes,
   Buffers* buffers
 ) const {
+  // Match CUDA value head exactly:
+  // 1. v1Conv: trunk -> v1Out (FP16 or FP32)
+  // 2. v1BN: v1Out -> v1Out2 (FP16 or FP32)
+  // 3. Convert v1Out2 to FP32 if FP16
+  // 4. Global pooling: -> v1Mean (ALWAYS FP32) [mean, scaledMean1, scaledMean2]
+  // 5. v2Mul: v1Mean -> v2Out (ALWAYS FP32)
+  // 6. v2Bias: v2Out -> v2Out (ALWAYS FP32)
+  // 7. v3Mul+v3Bias: v2Out -> valueBuf (ALWAYS FP32)
+  // 8. sv3Mul+sv3Bias: v2Out -> scoreValueBuf (ALWAYS FP32)
+  // 9. vOwnershipConv: v1Out2 -> ownershipBuf (FP16 conv -> FP32 output)
+
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   int v1Channels = v1Conv->outChannels;
   int ownershipChannels = vOwnershipConv->outChannels;
 
-  // Use pre-allocated intermediate buffers from Buffers struct
   void* v1OutBuf = buffers->v1OutBuf;
   void* v1Out2Buf = buffers->v1Out2Buf;
-  void* v1MeanBuf = buffers->v1MeanBuf;
-  void* v2OutBuf = buffers->v2OutBuf;
+  void* v1MeanBuf = buffers->v1MeanBuf;      // ALWAYS float
+  void* v2OutBuf = buffers->v2OutBuf;        // ALWAYS float
   void* ownershipScratchBuf = buffers->ownershipScratchBuf;
-  void* valueScratchBuf = buffers->valueScratchBuf;
-  void* scoreValueScratchBuf = buffers->scoreValueScratchBuf;
+
+  (void)maskSumBuf;  // TODO: Use for mask-aware pooling
 
   // Step 1: Apply v1Conv: trunk -> v1Out
   v1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), v1OutBuf, workspaceBuf, workspaceBytes);
@@ -2786,42 +3083,29 @@ void Model::applyValueHead(
   // Step 2: Apply v1BN: v1Out -> v1Out2
   v1BN->apply(handle, stream, batchSize, v1OutBuf, maskBuf, v1Out2Buf, workspaceBuf, workspaceBytes);
 
-  // Step 3: Value head global pooling on v1Out2 -> v1Mean
-  // CRITICAL: Value head uses DIFFERENT pooling than policy head!
-  // Value head output format per CUDA valueHeadPoolChannelsNCHWKernel:
-  //   [mean, scaledMean1, scaledMean2] -> [batch, v1Channels * 3]
-  //   scaledMean1 = mean * (sqrt(area) - 14) * 0.1
-  //   scaledMean2 = mean * ((sqrt(area) - 14)^2 * 0.01 - 0.1)
-  // Note: NO max pooling for value head!
+  // Step 3: Value head global pooling on v1Out2 -> v1Mean (ALWAYS FP32)
+  // Value head: [mean, scaledMean1, scaledMean2] (NO max)
   {
-    aclIntArray* outputSize = createAclIntArray({1, 1});
-
-    // Use scratchBuf for intermediate pooling results
-    // Layout: [meanFP16/FP32][meanFP32][scaledMean1Buf][scaledMean2Buf]
     size_t poolElts = (size_t)batchSize * v1Channels;
     size_t poolBytesFP32 = poolElts * sizeof(float);
     size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : poolBytesFP32;
 
-    void* meanPoolBuf = scratchBuf;  // [batch, v1Channels, 1, 1] in input dtype
-    void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;  // [batch, v1Channels, 1, 1] in FP32
+    void* meanPoolBuf = scratchBuf;
+    void* meanFP32Buf = (char*)scratchBuf + poolBytesDtype;
 
-    // 3a: Mean pooling using aclnnMean (reduce along H and W dimensions)
-    // Use ACL_FORMAT_ND for aclnnMean per API requirements
+    // 3a: Mean pooling
     aclTensor* v1Out2TensorND = handle->tensorCache.get(v1Out2Buf, {batchSize, v1Channels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
     aclTensor* meanPoolTensorND = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, dtype, ACL_FORMAT_ND);
 
     aclIntArray* meanReduceDims = createAclIntArray({2, 3});
-    bool meanKeepDim = true;
-
     uint64_t meanWsSize = 0;
     aclOpExecutor* meanExecutor = nullptr;
-    aclnnStatus status = aclnnMeanGetWorkspaceSize(v1Out2TensorND, meanReduceDims, meanKeepDim, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
+    aclnnStatus status = aclnnMeanGetWorkspaceSize(v1Out2TensorND, meanReduceDims, true, dtype, meanPoolTensorND, &meanWsSize, &meanExecutor);
     if(status == ACLNN_SUCCESS && meanWsSize <= workspaceBytes) {
       status = aclnnMean(workspaceBuf, meanWsSize, meanExecutor, stream);
     }
     aclDestroyIntArray(meanReduceDims);
     if(status != ACLNN_SUCCESS) {
-      aclDestroyIntArray(outputSize);
       throw StringError("aclnnMean failed for value head mean pooling: " + to_string(status));
     }
 
@@ -2834,18 +3118,17 @@ void Model::applyValueHead(
       aclOpExecutor* castExecutor = nullptr;
       status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
       if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
       }
       if(status != ACLNN_SUCCESS) {
-        aclDestroyIntArray(outputSize);
-        throw StringError("aclnnCast failed for value head mean pooling: " + to_string(status));
+        throw StringError("aclnnCast failed for value mean FP16->FP32: " + to_string(status));
       }
     } else {
       meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
       meanFP32Buf = meanPoolBuf;
     }
 
-    // 3c: Compute scaledMean1 = mean * (sqrt(area) - 14) * 0.1
+    // 3c: scaledMean1 = mean * (sqrt(area) - 14) * 0.1
     float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
     float scale1 = (sqrtArea - 14.0f) * 0.1f;
 
@@ -2861,12 +3144,11 @@ void Model::applyValueHead(
       }
       aclDestroyScalar(scaleScalar);
       if(status != ACLNN_SUCCESS) {
-        aclDestroyIntArray(outputSize);
-        throw StringError("aclnnMuls failed for value head scaledMean1: " + to_string(status));
+        throw StringError("aclnnMuls failed for value scaledMean1: " + to_string(status));
       }
     }
 
-    // 3d: Compute scaledMean2 = mean * ((sqrt(area) - 14)^2 * 0.01 - 0.1)
+    // 3d: scaledMean2 = mean * ((sqrt(area) - 14)^2 * 0.01 - 0.1)
     float scale2 = (sqrtArea - 14.0f) * (sqrtArea - 14.0f) * 0.01f - 0.1f;
 
     void* scaledMean2Buf = (char*)scaledMean1Buf + poolBytesFP32;
@@ -2881,12 +3163,11 @@ void Model::applyValueHead(
       }
       aclDestroyScalar(scaleScalar);
       if(status != ACLNN_SUCCESS) {
-        aclDestroyIntArray(outputSize);
-        throw StringError("aclnnMuls failed for value head scaledMean2: " + to_string(status));
+        throw StringError("aclnnMuls failed for value scaledMean2: " + to_string(status));
       }
     }
 
-    // 3e: Concatenate [mean, scaledMean1, scaledMean2] along channel dimension
+    // 3e: Concatenate [mean, scaledMean1, scaledMean2] -> v1Mean (FP32)
     aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor* scaledMean1_2D = handle->tensorCache.get(scaledMean1Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
     aclTensor* scaledMean2_2D = handle->tensorCache.get(scaledMean2Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -2894,8 +3175,7 @@ void Model::applyValueHead(
     aclTensor* tensorsForCat[3] = {mean2D, scaledMean1_2D, scaledMean2_2D};
     aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
     if(!tensorList) {
-      aclDestroyIntArray(outputSize);
-      throw StringError("aclCreateTensorList failed for value head global pooling concat");
+      throw StringError("aclCreateTensorList failed for value head concat");
     }
 
     aclTensor* concatOut = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -2907,94 +3187,39 @@ void Model::applyValueHead(
     }
     aclDestroyTensorList(tensorList);
     if(status != ACLNN_SUCCESS) {
-      aclDestroyIntArray(outputSize);
-      throw StringError("aclnnCat failed for value head global pooling concat: " + to_string(status));
+      throw StringError("aclnnCat failed for value head concat: " + to_string(status));
     }
-
-    aclDestroyIntArray(outputSize);
   }
 
-  // Step 4: Apply v2Mul: v1Mean -> v2Out
-  // CRITICAL: In FP16 mode, v1MeanBuf contains FP32 data from global pooling.
-  // MatMulLayer expects FP16 input, so we must convert FP32->FP16 first.
-  void* v1MeanInputBuf;  // Buffer to pass to MatMulLayer
-  if(useFP16) {
-    // Cast v1MeanBuf (FP32) -> v1MeanFP16Buf (FP16)
-    aclTensor* srcTensor = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels*3}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* dstTensor = handle->tensorCache.get(buffers->v1MeanFP16Buf, {batchSize, v1Channels*3}, ACL_FLOAT16, ACL_FORMAT_ND);
-    uint64_t castWsSize = 0;
-    aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
-    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-    }
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCast failed for value head v1Mean FP32->FP16: " + to_string(status));
-    }
-    v1MeanInputBuf = buffers->v1MeanFP16Buf;
-  } else {
-    v1MeanInputBuf = v1MeanBuf;
-  }
-  v2Mul->apply(handle, stream, batchSize, v1MeanInputBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+  // Step 4: v2Mul: v1Mean (FP32) -> v2Out (FP32)
+  // v2Mul is constructed with useFP16=false
+  v2Mul->apply(handle, stream, batchSize, v1MeanBuf, v2OutBuf, workspaceBuf, workspaceBytes);
 
-  // Step 5: Apply v2Bias: v2Out -> v2Out (in-place)
+  // Step 5: v2Bias: v2Out -> v2Out (in-place, ALWAYS FP32)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
 
-  // Step 6-7: Apply v3Mul + v3Bias: v2Out -> valueBuf
-  // In FP16 mode, output to scratch buffer first, then convert to FP32
-  if(useFP16) {
-    v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueScratchBuf, workspaceBuf, workspaceBytes);
-    v3Bias->apply(handle, stream, batchSize, valueScratchBuf, valueScratchBuf, workspaceBuf, workspaceBytes);
-    // Convert FP16 to FP32 for final output
-    {
-      aclTensor* srcTensor = handle->tensorCache.get(valueScratchBuf, {batchSize, numValueChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
-      aclTensor* dstTensor = handle->tensorCache.get(valueBuf, {batchSize, numValueChannels}, ACL_FLOAT, ACL_FORMAT_ND);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-    }
-  } else {
-    v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
-    v3Bias->apply(handle, stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
-  }
+  // Step 6-7: v3Mul + v3Bias: v2Out -> valueBuf (ALWAYS FP32)
+  v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
+  v3Bias->apply(handle, stream, batchSize, valueBuf, valueBuf, workspaceBuf, workspaceBytes);
 
-  // Step 8-9: Apply sv3Mul + sv3Bias: v2Out -> scoreValueBuf
-  // In FP16 mode, output to scratch buffer first, then convert to FP32
-  if(useFP16) {
-    sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueScratchBuf, workspaceBuf, workspaceBytes);
-    sv3Bias->apply(handle, stream, batchSize, scoreValueScratchBuf, scoreValueScratchBuf, workspaceBuf, workspaceBytes);
-    // Convert FP16 to FP32 for final output
-    {
-      aclTensor* srcTensor = handle->tensorCache.get(scoreValueScratchBuf, {batchSize, numScoreValueChannels}, ACL_FLOAT16, ACL_FORMAT_ND);
-      aclTensor* dstTensor = handle->tensorCache.get(scoreValueBuf, {batchSize, numScoreValueChannels}, ACL_FLOAT, ACL_FORMAT_ND);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-    }
-  } else {
-    sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
-    sv3Bias->apply(handle, stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
-  }
+  // Step 8-9: sv3Mul + sv3Bias: v2Out -> scoreValueBuf (ALWAYS FP32)
+  sv3Mul->apply(handle, stream, batchSize, v2OutBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
+  sv3Bias->apply(handle, stream, batchSize, scoreValueBuf, scoreValueBuf, workspaceBuf, workspaceBytes);
 
-  // Step 10: Apply vOwnershipConv: v1Out2 -> ownershipBuf
-  // If using FP16, output to ownershipScratchBuf first, then convert to FP32
+  // Step 10: vOwnershipConv: v1Out2 -> ownershipBuf
+  // vOwnershipConv uses FP16, ownershipBuf is FP32
   if(useFP16) {
     vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
-    // Convert FP16 to FP32 for final output
     aclTensor* srcTensor = handle->tensorCache.get(ownershipScratchBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
     aclTensor* dstTensor = handle->tensorCache.get(ownershipBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
-
     uint64_t castWsSize = 0;
     aclOpExecutor* castExecutor = nullptr;
     aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
     if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
+    }
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnCast failed for ownership FP16->FP32: " + to_string(status));
     }
   } else {
     vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
@@ -3580,10 +3805,11 @@ bool NeuralNet::testEvaluateResidualBlock(
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
-  // Allocate device buffers
+  // Allocate device buffers (3 buffers for trunkBuf, trunkScratchBuf, midBuf pattern)
   void* deviceInput = ascendMalloc(numInputFloats * eltSize);
   void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
   void* deviceScratch = ascendMalloc(numInputFloats * eltSize);
+  void* deviceMid = ascendMalloc(numInputFloats * eltSize);
 
   // Copy inputs to device
   ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
@@ -3602,8 +3828,21 @@ bool NeuralNet::testEvaluateResidualBlock(
   // Create scratch buffers (needs maxWorkspaceNeeded parameter)
   ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16, workspaceBytes);
 
-  // Apply residual block (takes 11 args including nnXLen, nnYLen and scratchBuf)
-  residualBlock->apply(nullptr, stream, batchSize, nnXLen, nnYLen, deviceMask, deviceInput, deviceScratch, deviceScratch, deviceWorkspace, workspaceBytes);
+  // Apply residual block with 3-buffer pattern (trunkBuf, trunkScratchBuf, midBuf)
+  // Note: handle=nullptr means we can't use tensorCache. The apply function
+  // creates tensor descriptors on the fly when handle is null (but this is not implemented
+  // for the new 3-buffer pattern). For now, create a minimal handle for the test.
+  // Actually, the new apply directly accesses handle->tensorCache. We need a handle.
+  // Since this is a test function that creates its own stream, create a temporary handle.
+  ComputeHandle* tempHandle = new ComputeHandle(0, useFP16, nnXLen, nnYLen, false, false);
+  tempHandle->stream = stream;
+  tempHandle->initScalars();
+  // Also need model/buffers set (nullptr OK since we're not using them)
+  tempHandle->model = nullptr;
+  tempHandle->buffers = nullptr;
+
+  residualBlock->apply(tempHandle, stream, batchSize, nnXLen, nnYLen, deviceMask,
+                     deviceInput, deviceScratch, deviceMid, deviceWorkspace, workspaceBytes);
 
   // Synchronize
   ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
@@ -3617,7 +3856,11 @@ bool NeuralNet::testEvaluateResidualBlock(
   ascendFree(deviceInput);
   ascendFree(deviceMask);
   ascendFree(deviceScratch);
+  ascendFree(deviceMid);
   delete residualBlock;
+  // Clean up temp handle (stream is owned by us, don't destroy it)
+  tempHandle->stream = nullptr;
+  delete tempHandle;
   ACL_CHECK(aclrtDestroyStream(stream), "aclrtDestroyStream");
 
   return true;
@@ -3660,10 +3903,18 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   void* deviceInput = ascendMalloc(numInputFloats * eltSize);
   void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
   float* deviceMaskSum = (float*)ascendMalloc(numMaskSumFloats * sizeof(float));
-  void* deviceRegularOut = ascendMalloc(numOutputFloats * eltSize);
-  void* deviceGpoolOut = ascendMalloc(numInputFloats * eltSize);
-  void* deviceGpoolConcat = ascendMalloc((size_t)batchSize * desc->gpoolConv.outChannels * 3 * sizeof(float));
-  void* deviceGpoolBias = ascendMalloc(numOutputFloats * eltSize);
+  void* deviceGpoolConvOut = ascendMalloc((size_t)batchSize * desc->gpoolConv.outChannels * nnXLen * nnYLen * eltSize);
+  void* deviceMidBuf = ascendMalloc(numOutputFloats * eltSize);
+  void* deviceTrunkScratch = ascendMalloc(numInputFloats * eltSize);
+
+  // Compute gpool scratch size
+  size_t gpoolElts = (size_t)batchSize * desc->gpoolConv.outChannels;
+  size_t gpoolBytesDtype = gpoolElts * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
+  size_t gpoolBytesFP32 = gpoolElts * sizeof(float);
+  size_t gpoolScratchBytes = 2 * gpoolBytesDtype + 5 * gpoolBytesFP32
+                           + gpoolElts * 3 * sizeof(float)
+                           + (size_t)batchSize * desc->regularConv.outChannels * sizeof(float);
+  void* deviceGpoolScratch = ascendMalloc(gpoolScratchBytes);
 
   // Copy inputs to device
   ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
@@ -3693,14 +3944,17 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
     deviceWorkspace = ascendMalloc(workspaceBytes);
   }
 
+  // Create temporary handle for tensorCache access
+  ComputeHandle* tempHandle = new ComputeHandle(0, useFP16, nnXLen, nnYLen, false, false);
+  tempHandle->stream = stream;
+  tempHandle->initScalars();
+  tempHandle->model = nullptr;
+  tempHandle->buffers = nullptr;
+
   // Apply global pooling residual block
-  // apply(ComputeHandle* handle, aclrtStream stream, int batchSize,
-  //       const void* maskBuf, const float* maskSumBuf, void* inputBuf,
-  //       void* regularOutBuf, void* gpoolOutBuf, void* gpoolConcatBuf,
-  //       void* gpoolBiasBuf, void* workspaceBuf, size_t workspaceBytes)
-  residualBlock->apply(nullptr, stream, batchSize, deviceMask, deviceMaskSum,
-                       deviceInput, deviceRegularOut, deviceGpoolOut,
-                       deviceGpoolConcat, deviceGpoolBias,
+  residualBlock->apply(tempHandle, stream, batchSize, deviceMask, deviceMaskSum,
+                       deviceInput, deviceTrunkScratch, deviceMidBuf,
+                       deviceGpoolConvOut, deviceGpoolScratch,
                        deviceWorkspace, workspaceBytes);
 
   // Synchronize
@@ -3715,11 +3969,14 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   ascendFree(deviceInput);
   ascendFree(deviceMask);
   ascendFree(deviceMaskSum);
-  ascendFree(deviceRegularOut);
-  ascendFree(deviceGpoolOut);
-  ascendFree(deviceGpoolConcat);
-  ascendFree(deviceGpoolBias);
+  ascendFree(deviceGpoolConvOut);
+  ascendFree(deviceMidBuf);
+  ascendFree(deviceTrunkScratch);
+  ascendFree(deviceGpoolScratch);
   delete residualBlock;
+  // Clean up temp handle (stream is owned by us, don't destroy it)
+  tempHandle->stream = nullptr;
+  delete tempHandle;
   ACL_CHECK(aclrtDestroyStream(stream), "aclrtDestroyStream");
 
   return true;
