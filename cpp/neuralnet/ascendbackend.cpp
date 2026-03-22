@@ -3441,67 +3441,41 @@ void NeuralNet::getOutput(
       ascendCopyH2D(buffers->inputMetaBuf, inputBuffers->userInputMetaBuffer, inputBuffers->singleInputMetaBytes * batchSize);
     }
   } else {
-    // For FP16 mode, copy to float buffer first, then convert to FP16
-    ascendCopyH2D(buffers->inputBufFloat, inputBuffers->userInputBuffer, inputBuffers->singleInputBytes * batchSize);
-    ascendCopyH2D(buffers->inputGlobalBufFloat, inputBuffers->userInputGlobalBuffer, inputBuffers->singleInputGlobalBytes * batchSize);
-    if(numMetaFeatures > 0) {
-      ascendCopyH2D(buffers->inputMetaBufFloat, inputBuffers->userInputMetaBuffer, inputBuffers->singleInputMetaBytes * batchSize);
-    }
+    // For FP16 mode, convert FP32 -> FP16 on HOST, then copy to device
+    // (aclnnCast is unreliable on some CANN/hardware combinations, error 561103)
+    // This is fast since input sizes are small relative to model weights
 
-    // Convert float to FP16 on device using aclnnCast (also outside graph)
-
-    // Convert spatial input
+    // Convert spatial input: FP32 host -> FP16 host -> device
     {
-      aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputBufFloat,
-        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputBuf,
-        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_ND);
-
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS) {
-        status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
+      size_t numSpatialElts = (size_t)batchSize * numSpatialFeatures * nnYLen * nnXLen;
+      const float* fp32Data = (const float*)inputBuffers->userInputBuffer;
+      vector<aclFloat16> fp16Data(numSpatialElts);
+      for(size_t i = 0; i < numSpatialElts; i++) {
+        fp16Data[i] = aclFloatToFloat16(fp32Data[i]);
       }
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for spatial input with error: " + to_string(status));
-      }
+      ascendCopyH2D(buffers->inputBuf, fp16Data.data(), numSpatialElts * sizeof(aclFloat16));
     }
 
     // Convert global input
     {
-      aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputGlobalBufFloat,
-        {batchSize, numGlobalFeatures}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputGlobalBuf,
-        {batchSize, numGlobalFeatures}, ACL_FLOAT16, ACL_FORMAT_ND);
-
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS) {
-        status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
+      size_t numGlobalElts = (size_t)batchSize * numGlobalFeatures;
+      const float* fp32Data = (const float*)inputBuffers->userInputGlobalBuffer;
+      vector<aclFloat16> fp16Data(numGlobalElts);
+      for(size_t i = 0; i < numGlobalElts; i++) {
+        fp16Data[i] = aclFloatToFloat16(fp32Data[i]);
       }
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for global input with error: " + to_string(status));
-      }
+      ascendCopyH2D(buffers->inputGlobalBuf, fp16Data.data(), numGlobalElts * sizeof(aclFloat16));
     }
 
     // Convert meta input if present
     if(numMetaFeatures > 0) {
-      aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputMetaBufFloat,
-        {batchSize, numMetaFeatures}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputMetaBuf,
-        {batchSize, numMetaFeatures}, ACL_FLOAT16, ACL_FORMAT_ND);
-
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT16, dstTensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS) {
-        status = aclnnCast(buffers->workspaceBuf, castWsSize, castExecutor, gpuHandle->stream);
+      size_t numMetaElts = (size_t)batchSize * numMetaFeatures;
+      const float* fp32Data = (const float*)inputBuffers->userInputMetaBuffer;
+      vector<aclFloat16> fp16Data(numMetaElts);
+      for(size_t i = 0; i < numMetaElts; i++) {
+        fp16Data[i] = aclFloatToFloat16(fp32Data[i]);
       }
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for meta input with error: " + to_string(status));
-      }
+      ascendCopyH2D(buffers->inputMetaBuf, fp16Data.data(), numMetaElts * sizeof(aclFloat16));
     }
   }
 
