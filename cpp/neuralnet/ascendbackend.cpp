@@ -2613,7 +2613,6 @@ void Model::apply(
 
     // Copy channel 0 to maskBuf (same dtype as input)
     size_t maskBytes = (size_t)batchSize * nnYLen * nnXLen * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
-    aclTensor* maskTensor = createAclTensor(maskBuf, maskViewShape, inputDtype, ACL_FORMAT_NCHW);
 
     // Use aclrtMemcpy for device-to-device copy (aclnnCopy doesn't exist in CANN)
     // maskBuf is at offset 0 of inputBuf, so just copy from inputBuf to maskBuf
@@ -2631,6 +2630,7 @@ void Model::apply(
 
     // Compute maskSum: sum mask values across spatial dims for each batch element
     // maskFloatBuf is always float
+    aclnnStatus status;
     if(useFP16) {
       // Cast mask from FP16 to FP32
       aclTensor* maskFP16Tensor = createAclTensor(maskBuf, maskViewShape, ACL_FLOAT16, ACL_FORMAT_NCHW);
