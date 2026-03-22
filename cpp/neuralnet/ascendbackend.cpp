@@ -727,8 +727,8 @@ struct Buffers {
 
   // Global pooling block buffers (needed by GlobalPoolingResidualBlock in trunk)
   void* gpoolConvOutBuf;      // Gpool conv output (full spatial: [B, gpoolC, H, W])
-  size_t gpoolConvOutBufBytes;
   void* gpoolScratchBuf;      // Gpool pooling intermediates (mean, max, concat, bias)
+  size_t gpoolConvOutBufBytes;
   size_t gpoolScratchBufBytes;
 
   // Size tracking
@@ -2412,6 +2412,9 @@ private:
     void* maskBuf,
     float* maskSumBuf,
     void* scratchBuf,
+    void* residualMidBuf,
+    void* gpoolConvOutBuf,
+    void* gpoolScratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const;
@@ -2611,15 +2614,12 @@ void Model::apply(
     size_t maskBytes = (size_t)batchSize * nnYLen * nnXLen * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
     aclTensor* maskTensor = createAclTensor(maskBuf, maskViewShape, inputDtype, ACL_FORMAT_NCHW);
 
-    uint64_t copyWsSize = 0;
-    aclOpExecutor* copyExecutor = nullptr;
-    aclnnStatus status = aclnnCopyGetWorkspaceSize(inputChannel0Tensor, maskTensor, &copyWsSize, &copyExecutor);
-    if(status == ACLNN_SUCCESS) {
-      status = aclnnCopy(workspaceBuf, copyWsSize, copyExecutor, stream);
-    }
+    // Use aclrtMemcpy for device-to-device copy (aclnnCopy doesn't exist in CANN)
+    // maskBuf is at offset 0 of inputBuf, so just copy from inputBuf to maskBuf
+    aclError copyErr = aclrtMemcpyAsync(maskBuf, maskBytes, inputBuf, maskBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
     aclDestroyTensor(inputChannel0Tensor);
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCopy failed for mask extraction: " + to_string(status));
+    if(copyErr != ACL_SUCCESS) {
+      throw StringError("aclrtMemcpyAsync failed for mask extraction: " + to_string(copyErr));
     }
 
     // If requireExactNNLen, set maskBuf to NULL to skip masking in BN layers
@@ -2698,7 +2698,7 @@ void Model::apply(
   // ================================================================
   // Step 2: Apply trunk
   // ================================================================
-  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, maskSumBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, maskSumBuf, scratchBuf, buffers->residualMidBuf, buffers->gpoolConvOutBuf, buffers->gpoolScratchBuf, workspaceBuf, workspaceBytes);
 
   // ================================================================
   // Step 3: Apply policy head
@@ -2722,6 +2722,9 @@ void Model::applyTrunk(
   void* maskBuf,
   float* maskSumBuf,
   void* scratchBuf,
+  void* residualMidBuf,
+  void* gpoolConvOutBuf,
+  void* gpoolScratchBuf,
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
@@ -2779,15 +2782,15 @@ void Model::applyTrunk(
       case ORDINARY_BLOCK_KIND:
         residualBlocks[regularIdx]->apply(
           handle, stream, batchSize, nnXLen, nnYLen, maskBuf,
-          scratchBuf, trunkOutputBuf, buffers->residualMidBuf,
+          scratchBuf, trunkOutputBuf, residualMidBuf,
           workspaceBuf, workspaceBytes);
         regularIdx++;
         break;
       case GLOBAL_POOLING_BLOCK_KIND:
         gpoolBlocks[gpoolIdx]->apply(
           handle, stream, batchSize, maskBuf, maskSumBuf,
-          scratchBuf, trunkOutputBuf, buffers->residualMidBuf,
-          buffers->gpoolConvOutBuf, buffers->gpoolScratchBuf,
+          scratchBuf, trunkOutputBuf, residualMidBuf,
+          gpoolConvOutBuf, gpoolScratchBuf,
           workspaceBuf, workspaceBytes);
         gpoolIdx++;
         break;
