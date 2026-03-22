@@ -395,6 +395,11 @@ public:
     if(it != cache.end()) return it->second;
 
     aclTensor* t = createAclTensor(data, shape, dtype, format);
+    if(t == nullptr) {
+      throw StringError("aclCreateTensor failed for shape [" +
+        [&shape]() { string s; for(auto d : shape) s += to_string(d) + ","; return s; }()
+        + "] dtype=" + to_string(dtype) + " format=" + to_string(format));
+    }
     cache[key] = t;
     return t;
   }
@@ -3448,9 +3453,9 @@ void NeuralNet::getOutput(
     // Convert spatial input
     {
       aclTensor* srcTensor = gpuHandle->tensorCache.get(buffers->inputBufFloat,
-        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_ND);
       aclTensor* dstTensor = gpuHandle->tensorCache.get(buffers->inputBuf,
-        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
+        {batchSize, numSpatialFeatures, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_ND);
 
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
