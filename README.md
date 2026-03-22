@@ -1,5 +1,53 @@
 # KataGo
 
+## AscendGo - Huawei Ascend NPU Backend
+
+This fork adds a native inference backend for [Huawei Ascend NPUs](https://www.hiascend.com/cann), targeting the **Ascend 910 Pro A** (32GB HBM2, 256 TFLOPS FP16, 512 TOPS INT8) with CANN 9.0.
+
+### Supported Hardware
+
+| Hardware | Status | Notes |
+|----------|--------|-------|
+| Ascend 910 Pro A | Supported | FP16 inference, 4x NPU multi-device |
+| Atlas 800I A2 (910B) | Untested | May work with CANN 9.0 |
+
+### Building
+
+```bash
+# Requires: CANN 9.0.0.beta, CMake >= 3.18, C++14 compiler (aarch64-linux)
+cd cpp
+mkdir build && cd build
+cmake -DUSE_BACKEND=ASCEND \
+      -DASCEND_HOME=/usr/local/Ascend/ascend-toolkit/latest \
+      -DNO_GIT_REVISION=1 ..
+make -j$(nproc)
+```
+
+### Running
+
+```bash
+# Benchmark a network
+./katago benchmark -model <network.bin.gz> -config ../configs/default_gtp.cfg
+
+# GTP engine
+./katago gtp -model <network.bin.gz> -config ../configs/default_gtp.cfg
+```
+
+### Supported Board Sizes
+
+9x9, 13x13, 19x19 (standard Go board sizes).
+
+### Implementation Details
+
+- Direct ACLNN operator calls (no ML framework dependency)
+- FP16 mixed precision (FP16 for trunk, FP32 for heads)
+- Multi-NPU support (round-robin across available devices)
+- Matches CUDA backend data flow (3-buffer residual block pattern, ordered block iteration, global pooling residual blocks)
+
+---
+
+*Below is the original KataGo README.*
+
 * [Overview](#overview)
 * [Training History and Research](#training-history-and-research)
 * [Where To Download Stuff](#where-to-download-stuff)
