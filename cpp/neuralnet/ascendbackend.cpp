@@ -2425,6 +2425,7 @@ private:
     int batchSize,
     const void* trunkOutputBuf,
     const void* maskBuf,
+    const void* maskFloatBuf,
     float* maskSumBuf,
     float* policyPassBuf,
     float* policyBuf,
@@ -2703,7 +2704,7 @@ void Model::apply(
   // ================================================================
   // Step 3: Apply policy head
   // ================================================================
-  applyPolicyHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, maskSumBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
+  applyPolicyHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, buffers->maskFloatBuf, maskSumBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
 
   // ================================================================
   // Step 4: Apply value head
@@ -2812,6 +2813,7 @@ void Model::applyPolicyHead(
   int batchSize,
   const void* trunkOutputBuf,
   const void* maskBuf,
+  const void* maskFloatBuf,
   float* maskSumBuf,
   float* policyPassBuf,
   float* policyBuf,
@@ -3023,7 +3025,9 @@ void Model::applyPolicyHead(
 
   // Step 7: p1BN: p1Out (FP32) -> scratchBuf (FP32)
   // p1BN is constructed with useFP16=false, so it does FP32 BN
-  p1BN->apply(handle, stream, batchSize, p1OutBuf, maskBuf, scratchBuf, workspaceBuf, workspaceBytes);
+  // CRITICAL: p1BN uses FP32 dtype internally, so it needs FP32 mask (maskFloatBuf),
+  // not the model-dtype maskBuf (which is FP16 in FP16 mode)
+  p1BN->apply(handle, stream, batchSize, p1OutBuf, maskFloatBuf, scratchBuf, workspaceBuf, workspaceBytes);
 
   // Step 8: p2Conv: scratchBuf (FP32) -> policyBuf (FP32)
   // p2Conv is constructed with useFP16=false
