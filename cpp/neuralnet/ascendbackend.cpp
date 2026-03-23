@@ -240,29 +240,7 @@ static void* ascendMallocAndCopyFP16(const vector<float>& hostData) {
   return ascendMallocAndCopyFP16(hostData.data(), hostData.size());
 }
 
-// Convert FP16 to FP32 on host (software implementation)
-static float aclFloat16ToFloat(aclFloat16 h) {
-  uint32_t x = (uint32_t)h;
-  uint32_t sign = (x >> 15) & 0x1;
-  uint32_t exponent = (x >> 10) & 0x1f;
-  uint32_t mantissa = x & 0x3ff;
-  if(exponent == 0 && mantissa == 0) {
-    uint32_t f = sign << 31;
-    float result;
-    memcpy(&result, &f, sizeof(float));
-    return result;
-  }
-  if(exponent == 0) {
-    while(!(mantissa & 0x400)) mantissa <<= 1;
-    exponent += 1;
-  }
-  uint32_t f = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
-  float result;
-  memcpy(&result, &f, sizeof(float));
-  return result;
-}
-
-// Device-side FP16 -> FP32 conversion (bypasses broken aclnnCast)
+// Device-side FP16 -> FP32 conversion (uses aclFloat16ToFloat from CANN 9.0)
 // Does D2H + host convert + H2D round trip. Use for small tensors only.
 static void castDeviceFP16ToFP32(aclrtStream stream, void* dstFP32, const void* srcFP16, size_t numElements) {
   size_t fp16Bytes = numElements * sizeof(aclFloat16);
@@ -2616,38 +2594,6 @@ void NestedBottleneckResidualBlock::apply(
     throw StringError("aclnnAdd failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
   }
 }
-    innerBlocks->apply(
-      handle, stream, batchSize, maskBuf, maskSumBuf,
-      midBuf, trunkScratchBuf, midBuf,
-      gpoolConvOutBuf, gpoolScratchBuf,
-      workspaceBuf, workspaceBytes
-    );
-
-    // Step 3: normActConv2: midBuf -> trunkBuf with residual add (accumulate=true)
-    // CUDA: normActConv2.apply(cudaHandles,batchSize,true,mid.buf,midScratch.buf,trunkBuf,maskBuf,...)
-    // BN+Act: midBuf -> trunkScratchBuf
-    normActConv2->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
-    // Conv: trunkScratchBuf -> midBuf
-    normActConv2->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
-
-    // Residual add: midBuf + trunkBuf -> trunkBuf
-    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
-    vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
-    aclTensor* midTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
-    aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
-
-    uint64_t addWsSize = 0;
-    aclOpExecutor* addExecutor = nullptr;
-    aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnAddGetWorkspaceSize failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
-    }
-    status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnAdd failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
-    }
-};
 
 //---------------------------------------------------------------------------------
 // Model Structure
