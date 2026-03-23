@@ -2032,6 +2032,8 @@ struct ResidualBlock {
     // Step 4: midConv: trunkScratchBuf → midBuf
     midNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
 
+    fprintf(stderr, "ASCEND:     residualBlock convs done, residual add\n");
+
     // Step 5: Residual add: midBuf + trunkBuf → trunkBuf
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
@@ -3046,6 +3048,7 @@ void Model::applyTrunk(
     int gpoolIdx = 0;
     int nestedIdx = 0;
     for(int i = 0; i < (int)trunkBlockKinds.size(); i++) {
+      fprintf(stderr, "ASCEND:   trunk block %d kind=%d start\n", i, trunkBlockKinds[i]);
       switch(trunkBlockKinds[i]) {
       case ORDINARY_BLOCK_KIND:
         residualBlocks[regularIdx]->apply(
