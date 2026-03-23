@@ -2189,20 +2189,11 @@ struct GlobalPoolingResidualBlock {
         throw StringError("aclnnMean failed for gpool block mean pooling: " + to_string(status));
       }
 
-      // 4b: Cast mean to FP32 if needed
+      // 4b: Cast mean to FP32 if needed (use host-side conversion, aclnnCast is unreliable in CANN 9.0)
       aclTensor* meanFP32Tensor;
       if(useFP16) {
-        aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+        castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts);
         meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
-        uint64_t castWsSize = 0;
-        aclOpExecutor* castExecutor = nullptr;
-        status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
-        if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-          status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-        }
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnCast failed for gpool mean FP16->FP32: " + to_string(status));
-        }
       } else {
         meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         meanFP32Buf = meanPoolBuf;
@@ -2222,20 +2213,12 @@ struct GlobalPoolingResidualBlock {
         throw StringError("aclnnAmax failed for gpool block max pooling: " + to_string(status));
       }
 
-      // 4d: Cast max to FP32 if needed
+      // 4d: Cast max to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
       aclTensor* maxFP32Tensor;
       if(useFP16) {
-        aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+        castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts);
         maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
-        uint64_t castWsSize = 0;
-        aclOpExecutor* castExecutor = nullptr;
-        status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, maxFP32Tensor, &castWsSize, &castExecutor);
-        if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-          status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-        }
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnCast failed for gpool max FP16->FP32: " + to_string(status));
-        }
+      }
       } else {
         maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         maxFP32Buf = maxPoolBuf;
@@ -3169,20 +3152,11 @@ void Model::applyPolicyHead(
       throw StringError("aclnnMean failed for policy head mean pooling: " + to_string(status));
     }
 
-    // Cast mean to FP32 if needed
+    // Cast mean to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
     aclTensor* meanFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+      castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts);
       meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for policy mean FP16->FP32: " + to_string(status));
-      }
     } else {
       meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       meanFP32Buf = meanPoolBuf;
@@ -3202,20 +3176,11 @@ void Model::applyPolicyHead(
       throw StringError("aclnnAmax failed for policy head max pooling: " + to_string(status));
     }
 
-    // Cast max to FP32 if needed
+    // Cast max to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
     aclTensor* maxFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+      castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts);
       maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, maxFP32Tensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for policy max FP16->FP32: " + to_string(status));
-      }
     } else {
       maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       maxFP32Buf = maxPoolBuf;
@@ -3371,20 +3336,11 @@ void Model::applyValueHead(
       throw StringError("aclnnMean failed for value head mean pooling: " + to_string(status));
     }
 
-    // 3b: Cast mean to FP32 if needed
+    // 3b: Cast mean to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
     aclTensor* meanFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+      castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts);
       meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for value mean FP16->FP32: " + to_string(status));
-      }
     } else {
       meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       meanFP32Buf = meanPoolBuf;
@@ -3463,17 +3419,7 @@ void Model::applyValueHead(
   // vOwnershipConv uses FP16, ownershipBuf is FP32
   if(useFP16) {
     vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
-    aclTensor* srcTensor = handle->tensorCache.get(ownershipScratchBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-    aclTensor* dstTensor = handle->tensorCache.get(ownershipBuf, {batchSize, ownershipChannels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
-    uint64_t castWsSize = 0;
-    aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
-    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-    }
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCast failed for ownership FP16->FP32: " + to_string(status));
-    }
+    castDeviceFP16ToFP32(stream, ownershipBuf, ownershipScratchBuf, (size_t)batchSize * ownershipChannels * nnYLen * nnXLen);
   } else {
     vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
   }
