@@ -242,13 +242,17 @@ static void* ascendMallocAndCopyFP16(const vector<float>& hostData) {
 
 // Device-side FP16 -> FP32 conversion (uses aclFloat16ToFloat from CANN 9.0)
 // Does D2H + host convert + H2D round trip. Use for small tensors only.
+// IMPORTANT: aclrtMemcpy (synchronous) blocks until the copy completes, but does NOT
+// wait for previous async operations on the stream. We must sync FIRST to ensure srcFP16
+// is ready before reading.
 static void castDeviceFP16ToFP32(aclrtStream stream, void* dstFP32, const void* srcFP16, size_t numElements) {
   size_t fp16Bytes = numElements * sizeof(aclFloat16);
   size_t fp32Bytes = numElements * sizeof(float);
   vector<aclFloat16> hostFP16(numElements);
   vector<float> hostFP32(numElements);
-  aclrtMemcpy(hostFP16.data(), fp16Bytes, srcFP16, fp16Bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+  // Sync FIRST to ensure all prior stream ops (e.g. the FP16 compute that wrote srcFP16) are complete
   aclrtSynchronizeStream(stream);
+  aclrtMemcpy(hostFP16.data(), fp16Bytes, srcFP16, fp16Bytes, ACL_MEMCPY_DEVICE_TO_HOST);
   for(size_t i = 0; i < numElements; i++)
     hostFP32[i] = aclFloat16ToFloat(hostFP16[i]);
   aclrtMemcpy(dstFP32, fp32Bytes, hostFP32.data(), fp32Bytes, ACL_MEMCPY_HOST_TO_DEVICE);
@@ -848,7 +852,6 @@ struct Buffers {
 
     // Allocate intermediate buffers
     trunkBuf = ascendMalloc(trunkBufBytes);
-    maskBuf = ascendMalloc(maskBufBytes);
     scratchBuf = ascendMalloc(scratchBufBytes);
     residualMidBuf = ascendMalloc(scratchBufBytes);  // Same size as trunk
 
@@ -2218,7 +2221,6 @@ struct GlobalPoolingResidualBlock {
       if(useFP16) {
         castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts);
         maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
-      }
       } else {
         maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         maxFP32Buf = maxPoolBuf;
