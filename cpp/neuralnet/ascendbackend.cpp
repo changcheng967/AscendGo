@@ -2259,28 +2259,19 @@ struct GlobalPoolingResidualBlock {
         }
       }
 
-      // 4f: Concatenate [mean, scaledMean, max] -> gpoolConcatBuf (in gpoolScratchBuf, NOT midBuf)
-      // midBuf still holds regularOut at this point - do NOT overwrite it
-      aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* scaledMean2D = handle->tensorCache.get(scaledMeanBuf, {batchSize, gpoolChannels}, ACL_FLOAT, ACL_FORMAT_ND);
-      aclTensor* max2D = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels}, ACL_FLOAT, ACL_FORMAT_ND);
-
-      aclTensor* tensorsForCat[3] = {mean2D, scaledMean2D, max2D};
-      aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
-      if(!tensorList) {
-        throw StringError("aclCreateTensorList failed for gpool block concat");
-      }
-
-      aclTensor* concatOut = handle->tensorCache.get(gpoolConcatBuf, {batchSize, gpoolChannels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
-      uint64_t catWsSize = 0;
-      aclOpExecutor* catExecutor = nullptr;
-      status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);
-      if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
-        status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
-      }
-      aclDestroyTensorList(tensorList);
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCat failed for gpool block concat: " + to_string(status));
+      // 4f: Concatenate [mean, scaledMean, max] -> gpoolConcatBuf using D2D copies
+      // (aclnnCat has compatibility issues with CANN 9.0; D2D memcpy is equivalent and more reliable)
+      {
+        size_t segmentBytes = poolElts * sizeof(float);
+        aclError copyErr = aclrtMemcpyAsync(gpoolConcatBuf, segmentBytes, meanFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        if(copyErr != ACL_SUCCESS)
+          throw StringError("aclrtMemcpyAsync failed for gpool block concat segment 0: " + to_string(copyErr));
+        copyErr = aclrtMemcpyAsync((char*)gpoolConcatBuf + segmentBytes, segmentBytes, scaledMeanBuf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        if(copyErr != ACL_SUCCESS)
+          throw StringError("aclrtMemcpyAsync failed for gpool block concat segment 1: " + to_string(copyErr));
+        copyErr = aclrtMemcpyAsync((char*)gpoolConcatBuf + 2 * segmentBytes, segmentBytes, maxFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        if(copyErr != ACL_SUCCESS)
+          throw StringError("aclrtMemcpyAsync failed for gpool block concat segment 2: " + to_string(copyErr));
       }
     }
 
@@ -3248,27 +3239,18 @@ void Model::applyPolicyHead(
       }
     }
 
-    // 4d: Concatenate [mean, scaledMean, max] -> g1Concat (FP32)
-    aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* scaledMean2D = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* max2D = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-
-    aclTensor* tensorsForCat[3] = {mean2D, scaledMean2D, max2D};
-    aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
-    if(!tensorList) {
-      throw StringError("aclCreateTensorList failed for policy head concat");
-    }
-
-    aclTensor* concatOut = handle->tensorCache.get(g1ConcatBuf, {batchSize, g1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
-    uint64_t catWsSize = 0;
-    aclOpExecutor* catExecutor = nullptr;
-    status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);
-    if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
-      status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
-    }
-    aclDestroyTensorList(tensorList);
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCat failed for policy head concat: " + to_string(status));
+    // 4d: Concatenate [mean, scaledMean, max] -> g1Concat (FP32) using D2D copies
+    {
+      size_t segmentBytes = poolElts * sizeof(float);
+      aclError copyErr = aclrtMemcpyAsync(g1ConcatBuf, segmentBytes, meanFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS)
+        throw StringError("aclrtMemcpyAsync failed for policy concat segment 0: " + to_string(copyErr));
+      copyErr = aclrtMemcpyAsync((char*)g1ConcatBuf + segmentBytes, segmentBytes, scaledMeanBuf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS)
+        throw StringError("aclrtMemcpyAsync failed for policy concat segment 1: " + to_string(copyErr));
+      copyErr = aclrtMemcpyAsync((char*)g1ConcatBuf + 2 * segmentBytes, segmentBytes, maxFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS)
+        throw StringError("aclrtMemcpyAsync failed for policy concat segment 2: " + to_string(copyErr));
     }
   }
 
@@ -3447,27 +3429,18 @@ void Model::applyValueHead(
       }
     }
 
-    // 3e: Concatenate [mean, scaledMean1, scaledMean2] -> v1Mean (FP32)
-    aclTensor* mean2D = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* scaledMean1_2D = handle->tensorCache.get(scaledMean1Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* scaledMean2_2D = handle->tensorCache.get(scaledMean2Buf, {batchSize, v1Channels}, ACL_FLOAT, ACL_FORMAT_ND);
-
-    aclTensor* tensorsForCat[3] = {mean2D, scaledMean1_2D, scaledMean2_2D};
-    aclTensorList* tensorList = aclCreateTensorList(tensorsForCat, 3);
-    if(!tensorList) {
-      throw StringError("aclCreateTensorList failed for value head concat");
-    }
-
-    aclTensor* concatOut = handle->tensorCache.get(v1MeanBuf, {batchSize, v1Channels * 3}, ACL_FLOAT, ACL_FORMAT_ND);
-    uint64_t catWsSize = 0;
-    aclOpExecutor* catExecutor = nullptr;
-    status = aclnnCatGetWorkspaceSize(tensorList, 1, concatOut, &catWsSize, &catExecutor);
-    if(status == ACLNN_SUCCESS && catWsSize <= workspaceBytes) {
-      status = aclnnCat(workspaceBuf, catWsSize, catExecutor, stream);
-    }
-    aclDestroyTensorList(tensorList);
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCat failed for value head concat: " + to_string(status));
+    // 3e: Concatenate [mean, scaledMean1, scaledMean2] -> v1Mean (FP32) using D2D copies
+    {
+      size_t segmentBytes = poolElts * sizeof(float);
+      aclError copyErr = aclrtMemcpyAsync(v1MeanBuf, segmentBytes, meanFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS)
+        throw StringError("aclrtMemcpyAsync failed for value concat segment 0: " + to_string(copyErr));
+      copyErr = aclrtMemcpyAsync((char*)v1MeanBuf + segmentBytes, segmentBytes, scaledMean1Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS)
+        throw StringError("aclrtMemcpyAsync failed for value concat segment 1: " + to_string(copyErr));
+      copyErr = aclrtMemcpyAsync((char*)v1MeanBuf + 2 * segmentBytes, segmentBytes, scaledMean2Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS)
+        throw StringError("aclrtMemcpyAsync failed for value concat segment 2: " + to_string(copyErr));
     }
   }
 
