@@ -240,6 +240,42 @@ static void* ascendMallocAndCopyFP16(const vector<float>& hostData) {
   return ascendMallocAndCopyFP16(hostData.data(), hostData.size());
 }
 
+// Convert FP16 to FP32 on host (software implementation)
+static float aclFloat16ToFloat(aclFloat16 h) {
+  uint32_t x = (uint32_t)h;
+  uint32_t sign = (x >> 15) & 0x1;
+  uint32_t exponent = (x >> 10) & 0x1f;
+  uint32_t mantissa = x & 0x3ff;
+  if(exponent == 0 && mantissa == 0) {
+    uint32_t f = sign << 31;
+    float result;
+    memcpy(&result, &f, sizeof(float));
+    return result;
+  }
+  if(exponent == 0) {
+    while(!(mantissa & 0x400)) mantissa <<= 1;
+    exponent += 1;
+  }
+  uint32_t f = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
+  float result;
+  memcpy(&result, &f, sizeof(float));
+  return result;
+}
+
+// Device-side FP16 -> FP32 conversion (bypasses broken aclnnCast)
+// Does D2H + host convert + H2D round trip. Use for small tensors only.
+static void castDeviceFP16ToFP32(aclrtStream stream, void* dstFP32, const void* srcFP16, size_t numElements) {
+  size_t fp16Bytes = numElements * sizeof(aclFloat16);
+  size_t fp32Bytes = numElements * sizeof(float);
+  vector<aclFloat16> hostFP16(numElements);
+  vector<float> hostFP32(numElements);
+  aclrtMemcpy(hostFP16.data(), fp16Bytes, srcFP16, fp16Bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+  aclrtSynchronizeStream(stream);
+  for(size_t i = 0; i < numElements; i++)
+    hostFP32[i] = aclFloat16ToFloat(hostFP16[i]);
+  aclrtMemcpy(dstFP32, fp32Bytes, hostFP32.data(), fp32Bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+}
+
 
 //---------------------------------------------------------------------------------
 // LoadedModel - simple wrapper around ModelDesc
@@ -2322,6 +2358,298 @@ struct GlobalPoolingResidualBlock {
 };
 
 //---------------------------------------------------------------------------------
+// BlockStack - forward declaration (defined after NestedBottleneckResidualBlock)
+//---------------------------------------------------------------------------------
+struct BlockStack;
+
+//---------------------------------------------------------------------------------
+// NestedBottleneckResidualBlock - bottleneck block with nested BlockStack
+//---------------------------------------------------------------------------------
+
+struct NestedBottleneckResidualBlock {
+  const string name;
+  unique_ptr<NormActConv> normActConv1;
+  unique_ptr<BlockStack> innerBlocks;
+  unique_ptr<NormActConv> normActConv2;
+  int numChannels;
+  int nnXLen;
+  int nnYLen;
+  bool useFP16;
+
+  NestedBottleneckResidualBlock() = delete;
+  NestedBottleneckResidualBlock(const NestedBottleneckResidualBlock&) = delete;
+  NestedBottleneckResidualBlock& operator=(const NestedBottleneckResidualBlock&) = delete;
+
+  NestedBottleneckResidualBlock(
+    const NestedBottleneckResidualBlockDesc* desc,
+    int nnX,
+    int nnY,
+    bool fp16
+  );
+
+  ~NestedBottleneckResidualBlock();
+
+  size_t requiredWorkspaceBytes(int batchSize, aclrtStream stream) const;
+
+  void apply(
+    ComputeHandle* handle,
+    aclrtStream stream,
+    int batchSize,
+    const void* maskBuf,
+    float* maskSumBuf,
+    void* trunkBuf,
+    void* trunkScratchBuf,
+    void* midBuf,
+    void* gpoolConvOutBuf,
+    void* gpoolScratchBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const;
+};
+
+//---------------------------------------------------------------------------------
+// BlockStack - container for mixed block types (used by trunk and NestedBottleneck)
+//---------------------------------------------------------------------------------
+
+struct BlockStack {
+  vector<pair<int, unique_ptr_void>> blocks;
+  int numBlocks;
+  int trunkNumChannels;
+  int nnXLen;
+  int nnYLen;
+  bool useFP16;
+
+  BlockStack() = delete;
+  BlockStack(const BlockStack&) = delete;
+  BlockStack& operator=(const BlockStack&) = delete;
+
+  BlockStack(
+    int nBlocks,
+    int trunkChannels,
+    const vector<pair<int, unique_ptr_void>>& descBlocks,
+    int nnX,
+    int nnY,
+    bool fp16
+  ) : numBlocks(nBlocks),
+      trunkNumChannels(trunkChannels),
+      nnXLen(nnX),
+      nnYLen(nnY),
+      useFP16(fp16)
+  {
+    assert(numBlocks == (int)descBlocks.size());
+    for(int i = 0; i < numBlocks; i++) {
+      if(descBlocks[i].first == ORDINARY_BLOCK_KIND) {
+        const ResidualBlockDesc* blockDesc = static_cast<const ResidualBlockDesc*>(descBlocks[i].second.get());
+        unique_ptr_void blockPtr = make_unique_void(
+          new ResidualBlock(blockDesc, nnX, nnY, fp16)
+        );
+        blocks.emplace_back(ORDINARY_BLOCK_KIND, std::move(blockPtr));
+      }
+      else if(descBlocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+        const GlobalPoolingResidualBlockDesc* blockDesc = static_cast<const GlobalPoolingResidualBlockDesc*>(descBlocks[i].second.get());
+        unique_ptr_void blockPtr = make_unique_void(
+          new GlobalPoolingResidualBlock(blockDesc, nnX, nnY, fp16)
+        );
+        blocks.emplace_back(GLOBAL_POOLING_BLOCK_KIND, std::move(blockPtr));
+      }
+      else if(descBlocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
+        const NestedBottleneckResidualBlockDesc* blockDesc = static_cast<const NestedBottleneckResidualBlockDesc*>(descBlocks[i].second.get());
+        unique_ptr_void blockPtr = make_unique_void(
+          new NestedBottleneckResidualBlock(blockDesc, nnX, nnY, fp16)
+        );
+        blocks.emplace_back(NESTED_BOTTLENECK_BLOCK_KIND, std::move(blockPtr));
+      }
+      else {
+        throw StringError("Unknown block kind in BlockStack: " + to_string(descBlocks[i].first));
+      }
+    }
+  }
+
+  ~BlockStack() {}
+
+  size_t requiredWorkspaceBytes(int batchSize, aclrtStream stream) const {
+    size_t bytes = 0;
+    for(int i = 0; i < (int)blocks.size(); i++) {
+      size_t b = 0;
+      if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+        ResidualBlock* block = static_cast<ResidualBlock*>(blocks[i].second.get());
+        b = block->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream);
+      }
+      else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+        GlobalPoolingResidualBlock* block = static_cast<GlobalPoolingResidualBlock*>(blocks[i].second.get());
+        b = block->requiredWorkspaceBytes(batchSize, stream);
+      }
+      else if(blocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
+        NestedBottleneckResidualBlock* block = static_cast<NestedBottleneckResidualBlock*>(blocks[i].second.get());
+        b = block->requiredWorkspaceBytes(batchSize, stream);
+      }
+      bytes = max(bytes, b);
+    }
+    return bytes;
+  }
+
+  void apply(
+    ComputeHandle* handle,
+    aclrtStream stream,
+    int batchSize,
+    const void* maskBuf,
+    float* maskSumBuf,
+    void* trunkBuf,
+    void* trunkScratchBuf,
+    void* midBuf,
+    void* gpoolConvOutBuf,
+    void* gpoolScratchBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    for(int i = 0; i < (int)blocks.size(); i++) {
+      if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+        ResidualBlock* block = static_cast<ResidualBlock*>(blocks[i].second.get());
+        block->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf,
+          trunkBuf, trunkScratchBuf, midBuf,
+          workspaceBuf, workspaceBytes);
+      }
+      else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+        GlobalPoolingResidualBlock* block = static_cast<GlobalPoolingResidualBlock*>(blocks[i].second.get());
+        block->apply(handle, stream, batchSize, maskBuf, maskSumBuf,
+          trunkBuf, trunkScratchBuf, midBuf,
+          gpoolConvOutBuf, gpoolScratchBuf,
+          workspaceBuf, workspaceBytes);
+      }
+      else if(blocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
+        NestedBottleneckResidualBlock* block = static_cast<NestedBottleneckResidualBlock*>(blocks[i].second.get());
+        block->apply(handle, stream, batchSize, maskBuf, maskSumBuf,
+          trunkBuf, trunkScratchBuf, midBuf,
+          gpoolConvOutBuf, gpoolScratchBuf,
+          workspaceBuf, workspaceBytes);
+      }
+    }
+  }
+};
+
+//---------------------------------------------------------------------------------
+// NestedBottleneckResidualBlock implementation (after BlockStack is defined)
+//---------------------------------------------------------------------------------
+
+NestedBottleneckResidualBlock::NestedBottleneckResidualBlock(
+  const NestedBottleneckResidualBlockDesc* desc,
+  int nnX,
+  int nnY,
+  bool fp16
+) : name(desc->name),
+    numChannels(desc->postConv.outChannels),
+    nnXLen(nnX),
+    nnYLen(nnY),
+    useFP16(fp16)
+{
+  normActConv1 = make_unique<NormActConv>(
+    &desc->preBN, &desc->preActivation, &desc->preConv, nnX, nnY, fp16);
+  innerBlocks = make_unique<BlockStack>(
+    desc->numBlocks, desc->preConv.outChannels, desc->blocks, nnX, nnY, fp16);
+  normActConv2 = make_unique<NormActConv>(
+    &desc->postBN, &desc->postActivation, &desc->postConv, nnX, nnY, fp16);
+}
+
+NestedBottleneckResidualBlock::~NestedBottleneckResidualBlock() {}
+
+size_t NestedBottleneckResidualBlock::requiredWorkspaceBytes(int batchSize, aclrtStream stream) const {
+  size_t bytes = 0;
+  bytes = max(bytes, normActConv1->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+  bytes = max(bytes, innerBlocks->requiredWorkspaceBytes(batchSize, stream));
+  bytes = max(bytes, normActConv2->requiredWorkspaceBytes(batchSize, nnXLen, nnYLen, stream));
+  return bytes;
+}
+
+void NestedBottleneckResidualBlock::apply(
+  ComputeHandle* handle,
+  aclrtStream stream,
+  int batchSize,
+  const void* maskBuf,
+  float* maskSumBuf,
+  void* trunkBuf,
+  void* trunkScratchBuf,
+  void* midBuf,
+  void* gpoolConvOutBuf,
+  void* gpoolScratchBuf,
+  void* workspaceBuf,
+  size_t workspaceBytes
+) const {
+  // Match CUDA's NestedBottleneckResidualBlock::apply exactly:
+  // 1. normActConv1: trunkBuf -> midBuf (BN+Act+Conv)
+  // 2. innerBlocks: midBuf -> midBuf (recursive)
+  // 3. normActConv2: midBuf -> trunkBuf with accumulate=true (residual add)
+
+  // Step 1: normActConv1: trunkBuf -> midBuf
+  // CUDA: normActConv1.apply(cudaHandles,batchSize,false,trunkBuf,trunkScratchBuf,mid.buf,maskBuf,...)
+  normActConv1->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
+  normActConv1->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+
+  // Step 2: innerBlocks operates on midBuf (as trunk) with trunkScratchBuf as scratch
+  // CUDA: blocks.apply(cudaHandles,scratch,batchSize,maskBuf,maskSumBuf,mid.buf,midScratch.buf,...)
+  innerBlocks->apply(
+    handle, stream, batchSize, maskBuf, maskSumBuf,
+    midBuf, trunkScratchBuf, midBuf,
+    gpoolConvOutBuf, gpoolScratchBuf,
+    workspaceBuf, workspaceBytes
+  );
+
+  // Step 3: normActConv2 with residual add (accumulate=true)
+  // CUDA: normActConv2.apply(cudaHandles,batchSize,true,mid.buf,midScratch.buf,trunkBuf,maskBuf,...)
+  normActConv2->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
+  normActConv2->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+
+  // Residual add: midBuf + trunkBuf -> trunkBuf
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
+  aclTensor* midTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
+  aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+  aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+
+  uint64_t addWsSize = 0;
+  aclOpExecutor* addExecutor = nullptr;
+  aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+  if(status != ACLNN_SUCCESS) {
+    throw StringError("aclnnAddGetWorkspaceSize failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
+  }
+  status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+  if(status != ACLNN_SUCCESS) {
+    throw StringError("aclnnAdd failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
+  }
+}
+    innerBlocks->apply(
+      handle, stream, batchSize, maskBuf, maskSumBuf,
+      midBuf, trunkScratchBuf, midBuf,
+      gpoolConvOutBuf, gpoolScratchBuf,
+      workspaceBuf, workspaceBytes
+    );
+
+    // Step 3: normActConv2: midBuf -> trunkBuf with residual add (accumulate=true)
+    // CUDA: normActConv2.apply(cudaHandles,batchSize,true,mid.buf,midScratch.buf,trunkBuf,maskBuf,...)
+    // BN+Act: midBuf -> trunkScratchBuf
+    normActConv2->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
+    // Conv: trunkScratchBuf -> midBuf
+    normActConv2->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+
+    // Residual add: midBuf + trunkBuf -> trunkBuf
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+    vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
+    aclTensor* midTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
+
+    uint64_t addWsSize = 0;
+    aclOpExecutor* addExecutor = nullptr;
+    aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAddGetWorkspaceSize failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
+    }
+    status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+    if(status != ACLNN_SUCCESS) {
+      throw StringError("aclnnAdd failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
+    }
+};
+
+//---------------------------------------------------------------------------------
 // Model Structure
 //---------------------------------------------------------------------------------
 
@@ -2350,6 +2678,7 @@ struct Model {
   unique_ptr<BatchNormLayer> trunkTipBN;
   vector<unique_ptr<ResidualBlock>> residualBlocks;
   vector<unique_ptr<GlobalPoolingResidualBlock>> gpoolBlocks;
+  vector<unique_ptr<NestedBottleneckResidualBlock>> nestedBlocks;
 
   // Ordered block kinds - matches CUDA BlockStack iteration order
   vector<int> trunkBlockKinds;
@@ -2486,6 +2815,9 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
     } else if(blockKind == GLOBAL_POOLING_BLOCK_KIND) {
       const GlobalPoolingResidualBlockDesc* gdesc = static_cast<const GlobalPoolingResidualBlockDesc*>(blockPair.second.get());
       gpoolBlocks.push_back(make_unique<GlobalPoolingResidualBlock>(gdesc, nnX, nnY, fp16));
+    } else if(blockKind == NESTED_BOTTLENECK_BLOCK_KIND) {
+      const NestedBottleneckResidualBlockDesc* ndesc = static_cast<const NestedBottleneckResidualBlockDesc*>(blockPair.second.get());
+      nestedBlocks.push_back(make_unique<NestedBottleneckResidualBlock>(ndesc, nnX, nnY, fp16));
     }
   }
 
@@ -2548,6 +2880,11 @@ size_t Model::requiredWorkspaceBytes(int maxBatchSize) const {
   // Residual blocks
   for(const auto& block : residualBlocks) {
     maxBytes = max(maxBytes, block->requiredWorkspaceBytes(maxBatchSize, nnXLen, nnYLen, nullptr));
+  }
+
+  // Nested bottleneck blocks
+  for(const auto& block : nestedBlocks) {
+    maxBytes = max(maxBytes, block->requiredWorkspaceBytes(maxBatchSize, nullptr));
   }
 
   // Policy head
@@ -2637,20 +2974,9 @@ void Model::apply(
     // maskFloatBuf is always float
     aclnnStatus status;
     if(useFP16) {
-      // Cast mask from FP16 to FP32
-      aclTensor* maskFP16Tensor = createAclTensor(maskBuf, maskViewShape, ACL_FLOAT16, ACL_FORMAT_NCHW);
-      aclTensor* maskFP32Tensor = createAclTensor(maskFloatBuf, maskViewShape, ACL_FLOAT, ACL_FORMAT_NCHW);
-      uint64_t castWsSize = 0;
-      aclOpExecutor* castExecutor = nullptr;
-      status = aclnnCastGetWorkspaceSize(maskFP16Tensor, ACL_FLOAT, maskFP32Tensor, &castWsSize, &castExecutor);
-      if(status == ACLNN_SUCCESS) {
-        status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-      }
-      aclDestroyTensor(maskFP16Tensor);
-      aclDestroyTensor(maskFP32Tensor);
-      if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnCast failed for mask FP16->FP32: " + to_string(status));
-      }
+      // Cast mask from FP16 to FP32 using host-side conversion (aclnnCast is broken)
+      size_t numMaskElts = (size_t)batchSize * nnYLen * nnXLen;
+      castDeviceFP16ToFP32(stream, maskFloatBuf, maskBuf, numMaskElts);
     } else {
       // In FP32 mode, maskBuf and maskFloatBuf share the same data
       maskFloatBuf = (float*)maskBuf;
@@ -2783,6 +3109,7 @@ void Model::applyTrunk(
   {
     int regularIdx = 0;
     int gpoolIdx = 0;
+    int nestedIdx = 0;
     for(int i = 0; i < (int)trunkBlockKinds.size(); i++) {
       switch(trunkBlockKinds[i]) {
       case ORDINARY_BLOCK_KIND:
@@ -2801,7 +3128,13 @@ void Model::applyTrunk(
         gpoolIdx++;
         break;
       case NESTED_BOTTLENECK_BLOCK_KIND:
-        throw StringError("NestedBottleneckResidualBlock not yet implemented in Ascend backend");
+        nestedBlocks[nestedIdx]->apply(
+          handle, stream, batchSize, maskBuf, maskSumBuf,
+          scratchBuf, trunkOutputBuf, residualMidBuf,
+          gpoolConvOutBuf, gpoolScratchBuf,
+          workspaceBuf, workspaceBytes);
+        nestedIdx++;
+        break;
       default:
         throw StringError("Unknown trunk block kind: " + to_string(trunkBlockKinds[i]));
       }
@@ -2854,21 +3187,10 @@ void Model::applyPolicyHead(
   // Step 1: Apply p1Conv: trunk -> p1Out
   if(useFP16) {
     // p1Conv outputs FP16, p1OutBuf is float-sized, so we need FP16->FP32 conversion
-    // Actually, CUDA stores p1Out in FP16 first then converts. Let's do the same.
-    // p1Conv -> scratchBuf (FP16), then convert scratchBuf -> p1OutBuf (FP32)
+    // Use host-side conversion (aclnnCast is broken on some CANN/hardware combos)
     p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
-    // Convert FP16 -> FP32
-    aclTensor* srcTensor = handle->tensorCache.get(scratchBuf, {batchSize, p1Channels, nnYLen, nnXLen}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-    aclTensor* dstTensor = handle->tensorCache.get(p1OutBuf, {batchSize, p1Channels, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_NCHW);
-    uint64_t castWsSize = 0;
-    aclOpExecutor* castExecutor = nullptr;
-    aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &castWsSize, &castExecutor);
-    if(status == ACLNN_SUCCESS && castWsSize <= workspaceBytes) {
-      status = aclnnCast(workspaceBuf, castWsSize, castExecutor, stream);
-    }
-    if(status != ACLNN_SUCCESS) {
-      throw StringError("aclnnCast failed for p1Conv FP16->FP32: " + to_string(status));
-    }
+    size_t p1Elts = (size_t)batchSize * p1Channels * nnYLen * nnXLen;
+    castDeviceFP16ToFP32(stream, p1OutBuf, scratchBuf, p1Elts);
   } else {
     p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
   }
