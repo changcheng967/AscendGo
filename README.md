@@ -14,24 +14,35 @@ This fork adds a native inference backend for [Huawei Ascend NPUs](https://www.h
 ### Building
 
 ```bash
-# Requires: CANN 9.0.0.beta, CMake >= 3.18, C++14 compiler (aarch64-linux)
+# Requires: CANN 9.0.0.beta, CMake >= 3.18, C++17 compiler (aarch64-linux)
 cd cpp
-mkdir build && cd build
+mkdir -p build && cd build
+
+# IMPORTANT: ASCEND_HOME must point to CANN 9.0, NOT the system-level CANN 8.3.
+# The default is /home/ma-user/Ascend/cann-9.0.0-beta.1
 cmake -DUSE_BACKEND=ASCEND \
-      -DASCEND_HOME=/usr/local/Ascend/ascend-toolkit/latest \
+      -DASCEND_HOME=/home/ma-user/Ascend/cann-9.0.0-beta.1 \
       -DNO_GIT_REVISION=1 ..
 make -j$(nproc)
+
+# If your CANN 9.0 is installed elsewhere, override ASCEND_HOME:
+# cmake -DUSE_BACKEND=ASCEND -DASCEND_HOME=/path/to/your/cann-9.0 -DNO_GIT_REVISION=1 ..
 ```
 
 ### Running
 
 ```bash
+# Set CANN environment (must match the version used at build time!)
+source /home/ma-user/Ascend/cann-9.0.0-beta.1/set_env.sh
+
 # Benchmark a network
 ./katago benchmark -model <network.bin.gz> -config ../configs/default_gtp.cfg
 
 # GTP engine
 ./katago gtp -model <network.bin.gz> -config ../configs/default_gtp.cfg
 ```
+
+**IMPORTANT:** The runtime CANN environment (`ASCEND_HOME_PATH`, `LD_LIBRARY_PATH`) must match the CANN version used at compile time. A version mismatch (e.g., compiling against CANN 8.3 but running with CANN 9.0 environment) will cause ACLNN operator failures (error 561103).
 
 ### Supported Board Sizes
 
