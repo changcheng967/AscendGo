@@ -2192,8 +2192,8 @@ struct GlobalPoolingResidualBlock {
       // 4b: Cast mean to FP32 if needed
       aclTensor* meanFP32Tensor;
       if(useFP16) {
-        aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-        meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+        meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         uint64_t castWsSize = 0;
         aclOpExecutor* castExecutor = nullptr;
         status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
@@ -2204,7 +2204,7 @@ struct GlobalPoolingResidualBlock {
           throw StringError("aclnnCast failed for gpool mean FP16->FP32: " + to_string(status));
         }
       } else {
-        meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         meanFP32Buf = meanPoolBuf;
       }
 
@@ -2225,8 +2225,8 @@ struct GlobalPoolingResidualBlock {
       // 4d: Cast max to FP32 if needed
       aclTensor* maxFP32Tensor;
       if(useFP16) {
-        aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-        maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+        maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         uint64_t castWsSize = 0;
         aclOpExecutor* castExecutor = nullptr;
         status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, maxFP32Tensor, &castWsSize, &castExecutor);
@@ -2237,14 +2237,14 @@ struct GlobalPoolingResidualBlock {
           throw StringError("aclnnCast failed for gpool max FP16->FP32: " + to_string(status));
         }
       } else {
-        maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+        maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
         maxFP32Buf = maxPoolBuf;
       }
 
       // 4e: scaledMean = mean * (sqrt(area) - 14) * 0.1
       float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
       float scale = (sqrtArea - 14.0f) * 0.1f;
-      aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       {
         aclScalar* scaleScalar = aclCreateScalar(&scale, ACL_FLOAT);
         uint64_t mulsWsSize = 0;
@@ -2958,7 +2958,7 @@ void Model::apply(
     // maskSum = mean * H * W
     float area = (float)(nnXLen * nnYLen);
     aclScalar* areaScalar = createFloatScalar(area);
-    aclTensor* maskSumTensor = createAclTensor(maskSumBuf, {batchSize, 1, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* maskSumTensor = createAclTensor(maskSumBuf, {batchSize, 1, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     uint64_t mulsWsSize = 0;
     aclOpExecutor* mulsExecutor = nullptr;
     status = aclnnInplaceMulsGetWorkspaceSize(maskSumTensor, areaScalar, &mulsWsSize, &mulsExecutor);
@@ -3181,8 +3181,8 @@ void Model::applyPolicyHead(
     // Cast mean to FP32 if needed
     aclTensor* meanFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
       status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
@@ -3193,7 +3193,7 @@ void Model::applyPolicyHead(
         throw StringError("aclnnCast failed for policy mean FP16->FP32: " + to_string(status));
       }
     } else {
-      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       meanFP32Buf = meanPoolBuf;
     }
 
@@ -3214,8 +3214,8 @@ void Model::applyPolicyHead(
     // Cast max to FP32 if needed
     aclTensor* maxFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-      maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* srcTensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+      maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
       status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, maxFP32Tensor, &castWsSize, &castExecutor);
@@ -3226,14 +3226,14 @@ void Model::applyPolicyHead(
         throw StringError("aclnnCast failed for policy max FP16->FP32: " + to_string(status));
       }
     } else {
-      maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       maxFP32Buf = maxPoolBuf;
     }
 
     // 4c: scaledMean = mean * (sqrt(area) - 14) * 0.1
     float sqrtArea = sqrtf((float)(nnXLen * nnYLen));
     float scale = (sqrtArea - 14.0f) * 0.1f;
-    aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* scaledMeanTensor = handle->tensorCache.get(scaledMeanBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     {
       aclScalar* scaleScalar = aclCreateScalar(&scale, ACL_FLOAT);
       uint64_t mulsWsSize = 0;
@@ -3392,8 +3392,8 @@ void Model::applyValueHead(
     // 3b: Cast mean to FP32 if needed
     aclTensor* meanFP32Tensor;
     if(useFP16) {
-      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_NCHW);
-      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* srcTensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT16, ACL_FORMAT_ND);
+      meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       uint64_t castWsSize = 0;
       aclOpExecutor* castExecutor = nullptr;
       status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, meanFP32Tensor, &castWsSize, &castExecutor);
@@ -3404,7 +3404,7 @@ void Model::applyValueHead(
         throw StringError("aclnnCast failed for value mean FP16->FP32: " + to_string(status));
       }
     } else {
-      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+      meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       meanFP32Buf = meanPoolBuf;
     }
 
@@ -3413,7 +3413,7 @@ void Model::applyValueHead(
     float scale1 = (sqrtArea - 14.0f) * 0.1f;
 
     void* scaledMean1Buf = (char*)meanFP32Buf + poolBytesFP32;
-    aclTensor* scaledMean1Tensor = handle->tensorCache.get(scaledMean1Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* scaledMean1Tensor = handle->tensorCache.get(scaledMean1Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     {
       aclScalar* scaleScalar = aclCreateScalar(&scale1, ACL_FLOAT);
       uint64_t mulsWsSize = 0;
@@ -3432,7 +3432,7 @@ void Model::applyValueHead(
     float scale2 = (sqrtArea - 14.0f) * (sqrtArea - 14.0f) * 0.01f - 0.1f;
 
     void* scaledMean2Buf = (char*)scaledMean1Buf + poolBytesFP32;
-    aclTensor* scaledMean2Tensor = handle->tensorCache.get(scaledMean2Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_NCHW);
+    aclTensor* scaledMean2Tensor = handle->tensorCache.get(scaledMean2Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     {
       aclScalar* scaleScalar = aclCreateScalar(&scale2, ACL_FLOAT);
       uint64_t mulsWsSize = 0;
