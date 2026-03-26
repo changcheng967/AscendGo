@@ -1997,23 +1997,21 @@ struct ResidualBlock {
 
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
     int channels = numChannels;
-    int xLen = preNormActConv->convLayer->nnXLen;
-    int yLen = preNormActConv->convLayer->nnYLen;
 
     // Step 1: BN+Act: trunkBuf -> midScratch (preserve trunkBuf for residual)
     preNormActConv->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, midScratch.buf, workspaceBuf, workspaceBytes);
 
     // Step 2: Conv: midScratch -> midIn
-    preNormActConv->convLayer->apply(handle, stream, batchSize, xLen, yLen, false, midScratch.buf, midIn.buf, workspaceBuf, workspaceBytes);
+    preNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, midScratch.buf, midIn.buf, workspaceBuf, workspaceBytes);
 
     // Step 3: BN+Act: midIn -> trunkScratchBuf
     midNormActConv->bnLayer->apply(handle, stream, batchSize, midIn.buf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
 
     // Step 4: Conv: trunkScratchBuf -> midIn
-    midNormActConv->convLayer->apply(handle, stream, batchSize, xLen, yLen, false, trunkScratchBuf, midIn.buf, workspaceBuf, workspaceBytes);
+    midNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midIn.buf, workspaceBuf, workspaceBytes);
 
     // Step 5: Residual add: midIn + trunkBuf -> trunkBuf
-    vector<int64_t> addShape = {batchSize, channels, yLen, xLen};
+    vector<int64_t addShape = {batchSize, channels, nnYLen, nnXLen};
     aclTensor* midTensor = handle->tensorCache.get(midIn.buf, addShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
@@ -2168,8 +2166,6 @@ struct GlobalPoolingResidualBlock {
     //
     // KEY: midBuf holds regularOut throughout. gpoolScratchBuf holds pooling intermediates.
     // workspaceBuf is ONLY used for ACLNN operator workspace (never for data storage).
-
-    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
 
     // Step 1: preBN on trunk -> trunkScratchBuf (trunkBuf preserved for residual)
     preBN->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
@@ -2520,6 +2516,7 @@ size_t NestedBottleneckResidualBlock::requiredWorkspaceBytes(int batchSize, aclr
 
 void NestedBottleneckResidualBlock::apply(
   ComputeHandle* handle,
+  ScratchBuffers* scratch,
   aclrtStream stream,
   int batchSize,
   const void* maskBuf,
