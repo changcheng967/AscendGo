@@ -278,6 +278,7 @@ struct LoadedModel {
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
     ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
+    modelDesc.applyScale8ToReduceActivations();
   }
 
   LoadedModel() = delete;
@@ -1473,18 +1474,33 @@ struct BatchNormLayer {
       }
     }
     // MISH_SCALE8: mishf_scale8(x) = x * tanh(softplus(x * 8)) = mish(x*8) / 8
-    // NOTE: Original implementation did mish(x) * 8 which is mathematically different.
-    // Keeping old behavior for now to match the working baseline.
-    // TODO: Fix to correct semantics (scale 8 -> mish -> scale 1/8) after verifying
-    // that the model doesn't use MISH_SCALE8 in BatchNorm trunk blocks.
+    // Implementation: scale by 8, apply mish, scale by 1/8
     else if(activation == ACTIVATION_MISH_SCALE8) {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
       aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
 
+      // Step 1: Scale by 8
+      aclScalar* scale8Scalar = createFloatScalar(8.0f);
+      uint64_t mulsWsSize = 0;
+      aclOpExecutor* mulsExecutor = nullptr;
+
+      aclnnStatus status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, scale8Scalar, &mulsWsSize, &mulsExecutor);
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyScalar(scale8Scalar);
+        throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 step1 " + name + ": " + to_string(status));
+      }
+
+      status = aclnnInplaceMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+      aclDestroyScalar(scale8Scalar);
+      if(status != ACLNN_SUCCESS) {
+        throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 step1 " + name + ": " + to_string(status));
+      }
+
+      // Step 2: Apply mish
       uint64_t mishWsSize = 0;
       aclOpExecutor* mishExecutor = nullptr;
 
-      aclnnStatus status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &mishWsSize, &mishExecutor);
+      status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &mishWsSize, &mishExecutor);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnInplaceMishGetWorkspaceSize failed for BatchNorm MISH_SCALE8 " + name + ": " + to_string(status));
       }
@@ -1494,21 +1510,21 @@ struct BatchNormLayer {
         throw StringError("aclnnInplaceMish failed for BatchNorm MISH_SCALE8 " + name + ": " + to_string(status));
       }
 
-      // Scale by 8.0 (old behavior - TODO: this should be mish(x*8)/8 instead)
-      aclScalar* scaleScalar = createFloatScalar(8.0f);
+      // Step 3: Scale by 1/8 (0.125)
+      aclScalar* invScale8Scalar = createFloatScalar(0.125f);
       uint64_t mulWsSize = 0;
       aclOpExecutor* mulExecutor = nullptr;
 
-      status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, scaleScalar, &mulWsSize, &mulExecutor);
+      status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, invScale8Scalar, &mulWsSize, &mulExecutor);
       if(status != ACLNN_SUCCESS) {
-        aclDestroyScalar(scaleScalar);
-        throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 " + name + ": " + to_string(status));
+        aclDestroyScalar(invScale8Scalar);
+        throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 step3 " + name + ": " + to_string(status));
       }
 
       status = aclnnInplaceMuls(workspaceBuf, mulWsSize, mulExecutor, stream);
-      aclDestroyScalar(scaleScalar);
+      aclDestroyScalar(invScale8Scalar);
       if(status != ACLNN_SUCCESS) {
-        throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 " + name + ": " + to_string(status));
+        throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 step3 " + name + ": " + to_string(status));
       }
     }
 
@@ -2959,13 +2975,14 @@ void Model::applyTrunk(
     metaMul1->apply(handle, stream, batchSize, inputMetaBuf, metaBuf1, workspaceBuf, workspaceBytes);
     // bias1: in-place bias on metaBuf1
     metaBias1->apply(handle, stream, batchSize, metaBuf1, metaBuf1, workspaceBuf, workspaceBytes);
-    // TODO: activation1 should be applied here (metaAct1Type) but disabled for now
-    // to match the working Q15/F19/A18 baseline. Needs debugging of applyActivationToNC.
+    // activation1 after bias1
+    applyActivationToNC(handle, stream, metaBuf1, batchSize, metaMul1->outChannels, metaAct1Type, useFP16, workspaceBuf, workspaceBytes);
     // mul2: (batch, internal1) -> (batch, internal2)
     metaMul2->apply(handle, stream, batchSize, metaBuf1, metaBuf2, workspaceBuf, workspaceBytes);
     // bias2: in-place bias on metaBuf2
     metaBias2->apply(handle, stream, batchSize, metaBuf2, metaBuf2, workspaceBuf, workspaceBytes);
-    // TODO: activation2 should be applied here (metaAct2Type) but disabled for now
+    // activation2 after bias2
+    applyActivationToNC(handle, stream, metaBuf2, batchSize, metaMul2->outChannels, metaAct2Type, useFP16, workspaceBuf, workspaceBytes);
     // mul3: (batch, internal2) -> (batch, trunkChannels)
     metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
 
@@ -3221,7 +3238,8 @@ void Model::applyPolicyHead(
   if(modelVersion >= 15) {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
     gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    // TODO: passActivation should be applied here (passActivationType) but disabled for now
+    // passActivation after gpoolToPassBias
+    applyActivationToNC(handle, stream, p1PassBuf, batchSize, gpoolToPassMul->outChannels, passActivationType, false, workspaceBuf, workspaceBytes);
     gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   } else {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
@@ -3370,7 +3388,8 @@ void Model::applyValueHead(
 
   // Step 5: v2Bias: v2Out -> v2Out (in-place, ALWAYS FP32)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
-  // TODO: v2Activation should be applied here (v2ActivationType) but disabled for now
+  // v2Activation after v2Bias
+  applyActivationToNC(handle, stream, v2OutBuf, batchSize, v2Mul->outChannels, v2ActivationType, false, workspaceBuf, workspaceBytes);
 
   // Step 6-7: v3Mul + v3Bias: v2Out -> valueBuf (ALWAYS FP32)
   v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
