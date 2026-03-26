@@ -2842,11 +2842,11 @@ void Model::applyTrunk(
     // mul1: (batch, metaIn) -> (batch, internal1)
     metaMul1->apply(handle, stream, batchSize, inputMetaBuf, metaBuf1, workspaceBuf, workspaceBytes);
     // bias1: in-place bias + activation on metaBuf1
-    metaBias1->apply(handle, stream, batchSize, metaBuf1, workspaceBuf, workspaceBytes);
+    metaBias1->apply(handle, stream, batchSize, metaBuf1, metaBuf1, workspaceBuf, workspaceBytes);
     // mul2: (batch, internal1) -> (batch, internal2)
     metaMul2->apply(handle, stream, batchSize, metaBuf1, metaBuf2, workspaceBuf, workspaceBytes);
     // bias2: in-place bias + activation on metaBuf2
-    metaBias2->apply(handle, stream, batchSize, metaBuf2, workspaceBuf, workspaceBytes);
+    metaBias2->apply(handle, stream, batchSize, metaBuf2, metaBuf2, workspaceBuf, workspaceBytes);
     // mul3: (batch, internal2) -> (batch, trunkChannels)
     metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
 
