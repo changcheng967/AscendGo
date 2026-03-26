@@ -277,6 +277,27 @@ static void castDeviceFP16ToFP32(
   aclrtMemcpy(dstFP32, fp32Bytes, hostFP32.data(), fp32Bytes, ACL_MEMCPY_HOST_TO_DEVICE);
 }
 
+static void castDeviceFP32ToFP16(
+  aclrtStream stream,
+  void* dstFP16, const void* srcFP32, size_t numElements,
+  void* workspaceBuf, size_t workspaceBytes
+) {
+  (void)workspaceBuf;
+  (void)workspaceBytes;
+  if(numElements == 0) return;
+
+  size_t fp16Bytes = numElements * sizeof(aclFloat16);
+  size_t fp32Bytes = numElements * sizeof(float);
+  vector<float> hostFP32(numElements);
+  vector<aclFloat16> hostFP16(numElements);
+
+  aclrtSynchronizeStream(stream);
+  aclrtMemcpy(hostFP32.data(), fp32Bytes, srcFP32, fp32Bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+  for(size_t i = 0; i < numElements; i++)
+    hostFP16[i] = aclFloatToFloat16(hostFP32[i]);
+  aclrtMemcpy(dstFP16, fp16Bytes, hostFP16.data(), fp16Bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+}
+
 
 //---------------------------------------------------------------------------------
 // LoadedModel - simple wrapper around ModelDesc
@@ -486,6 +507,22 @@ struct ComputeHandle {
   // Instead of D2D copy, swap trunk/scratch pointers
   bool trunkIsPrimary;  // true = trunk is primaryBuf, scratch is secondaryBuf
 
+  // Deferred device memory frees - buffers that are still in-use by async stream ops
+  // Freed after stream sync in getOutput
+  std::vector<void*> deferredFrees;
+
+  void deferFree(void* ptr) {
+    if(ptr != nullptr)
+      deferredFrees.push_back(ptr);
+  }
+
+  void flushDeferredFrees() {
+    for(void* ptr : deferredFrees) {
+      ascendFree(ptr);
+    }
+    deferredFrees.clear();
+  }
+
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
   ComputeHandle& operator=(const ComputeHandle&) = delete;
@@ -511,6 +548,12 @@ struct ComputeHandle {
     // Set device context first since destructor may run on a different thread
     // CANN's device binding is thread-local
     aclrtSetDevice(deviceIdx);
+
+    // Free any remaining deferred allocations
+    for(void* ptr : deferredFrees) {
+      ascendFree(ptr);
+    }
+    deferredFrees.clear();
 
     if(alphaOneScalarFP16 != nullptr) {
       aclDestroyScalar(alphaOneScalarFP16);
@@ -2221,22 +2264,48 @@ struct GlobalPoolingResidualBlock {
     gpoolToBiasMul->apply(handle, stream, batchSize, gpoolConcat.buf, gpoolBias.buf, workspaceBuf, workspaceBytes);
 
     // Step 6: Add gpoolBias to regularOut (midBuf) - broadcast across spatial dims
+    // CRITICAL: gpoolBias is always FP32 (from FP32 matmul), but regularOut may be FP16.
+    // In FP16 mode, convert gpoolBias to FP16 first to avoid mixed-dtype aclnnAdd.
+    // Match CUDA: CUDA uses FP16 gpoolToBiasMul in FP16 mode so the bias is already FP16.
     {
       vector<int64_t> regularOutShape = {batchSize, regularChannels, nnYLen, nnXLen};
       vector<int64_t> biasShape = {batchSize, regularChannels, 1, 1};
 
       aclTensor* regularOutTensor = handle->tensorCache.get(midBuf, regularOutShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* biasTensor = handle->tensorCache.get(gpoolBias.buf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
       aclTensor* resultTensor = handle->tensorCache.get(midBuf, regularOutShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
-      aclnnStatus addStatus = aclnnAddGetWorkspaceSize(regularOutTensor, biasTensor, handle->getAlphaOne(dtype), resultTensor, &addWsSize, &addExecutor);
-      if(addStatus == ACLNN_SUCCESS) {
-        addStatus = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
-      }
-      if(addStatus != ACLNN_SUCCESS) {
-        throw StringError("aclnnAdd failed for gpool block bias add: " + to_string(addStatus));
+      aclnnStatus addStatus;
+
+      if(useFP16) {
+        // Convert gpoolBias from FP32 to FP16 into a temp buffer (poolScratch has space after pooling)
+        size_t biasElts = (size_t)batchSize * regularChannels;
+        // poolScratch layout: [mean | meanFP32 | max | maxFP32 | scaledMean]
+        // After pooling, scaledMean is the last used region. Use space after it.
+        // But we need biasElts * 2 bytes (FP16). poolScratch may not have enough.
+        // Use a separate allocation from scratch.
+        size_t biasFP16Bytes = biasElts * sizeof(aclFloat16);
+        SizedBuf<void*> biasFP16(scratch->allocator, biasFP16Bytes);
+        castDeviceFP32ToFP16(stream, biasFP16.buf, gpoolBias.buf, biasElts, workspaceBuf, workspaceBytes);
+
+        aclTensor* biasFP16Tensor = handle->tensorCache.get(biasFP16.buf, biasShape, ACL_FLOAT16, ACL_FORMAT_NCHW);
+        addStatus = aclnnAddGetWorkspaceSize(regularOutTensor, biasFP16Tensor, handle->getAlphaOne(ACL_FLOAT16), resultTensor, &addWsSize, &addExecutor);
+        if(addStatus == ACLNN_SUCCESS) {
+          addStatus = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+        }
+        if(addStatus != ACLNN_SUCCESS) {
+          throw StringError("aclnnAdd failed for gpool block bias add: " + to_string(addStatus));
+        }
+      } else {
+        aclTensor* biasTensor = handle->tensorCache.get(gpoolBias.buf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
+        addStatus = aclnnAddGetWorkspaceSize(regularOutTensor, biasTensor, handle->getAlphaOne(ACL_FLOAT), resultTensor, &addWsSize, &addExecutor);
+        if(addStatus == ACLNN_SUCCESS) {
+          addStatus = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
+        }
+        if(addStatus != ACLNN_SUCCESS) {
+          throw StringError("aclnnAdd failed for gpool block bias add: " + to_string(addStatus));
+        }
       }
     }
 
@@ -3012,9 +3081,9 @@ void Model::applyTrunk(
     metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
 
     // Broadcast-add metaOutput (batch, trunkChannels, 1, 1) to scratchBuf (batch, trunkChannels, H, W)
-    aclTensor* trunkTensor = handle->tensorCache.get(scratchBuf, {(int64_t)batchSize, (int64_t)trunkChannels, (int64_t)nnYLen, (int64_t)nnXLen}, metaDtype, ACL_FORMAT_ND);
-    aclTensor* metaOutTensor = handle->tensorCache.get(metaOutput, {(int64_t)batchSize, (int64_t)trunkChannels, 1, 1}, metaDtype, ACL_FORMAT_ND);
-    aclTensor* trunkResultTensor = handle->tensorCache.get(scratchBuf, {(int64_t)batchSize, (int64_t)trunkChannels, (int64_t)nnYLen, (int64_t)nnXLen}, metaDtype, ACL_FORMAT_ND);
+    aclTensor* trunkTensor = handle->tensorCache.get(scratchBuf, {(int64_t)batchSize, (int64_t)trunkChannels, (int64_t)nnYLen, (int64_t)nnXLen}, metaDtype, ACL_FORMAT_NCHW);
+    aclTensor* metaOutTensor = handle->tensorCache.get(metaOutput, {(int64_t)batchSize, (int64_t)trunkChannels, 1, 1}, metaDtype, ACL_FORMAT_NCHW);
+    aclTensor* trunkResultTensor = handle->tensorCache.get(scratchBuf, {(int64_t)batchSize, (int64_t)trunkChannels, (int64_t)nnYLen, (int64_t)nnXLen}, metaDtype, ACL_FORMAT_NCHW);
 
     uint64_t metaAddWsSize = 0;
     aclOpExecutor* metaAddExecutor = nullptr;
@@ -3022,9 +3091,11 @@ void Model::applyTrunk(
     if(metaStatus == ACLNN_SUCCESS && metaAddWsSize <= workspaceBytes) {
       metaStatus = aclnnAdd(workspaceBuf, metaAddWsSize, metaAddExecutor, stream);
     }
-    ascendFree(metaBuf1);
-    ascendFree(metaBuf2);
-    ascendFree(metaOutput);
+    // Defer free - metaOutput is still being read by async aclnnAdd on the stream.
+    // These will be freed after stream sync in getOutput.
+    handle->deferFree(metaBuf1);
+    handle->deferFree(metaBuf2);
+    handle->deferFree(metaOutput);
     if(metaStatus != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for metadata encoder: " + to_string(metaStatus));
     }
@@ -3697,6 +3768,10 @@ void NeuralNet::getOutput(
       + " (batchSize=" + to_string(batchSize) + ")";
     throw StringError(errMsg);
   }
+
+  // Free any deferred allocations (e.g., metadata encoder temp buffers)
+  // that were still in-use by async stream ops before sync
+  gpuHandle->flushDeferredFrees();
 
   // ========================================================================
   // PHASE 3: Copy outputs D2H (OUTSIDE graph capture - need fresh data)
