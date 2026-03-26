@@ -1454,7 +1454,7 @@ struct BatchNormLayer {
       }
     }
     // MISH activation using native ACLNN operator
-    else if(activation == ACTIVATION_MISH || activation == ACTIVATION_MISH_SCALE8) {
+    else if(activation == ACTIVATION_MISH) {
       vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
 
       aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
@@ -1471,26 +1471,55 @@ struct BatchNormLayer {
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnInplaceMish failed for BatchNorm " + name + " with error: " + to_string(status));
       }
+    }
+    // MISH_SCALE8: mishf_scale8(x) = x * tanh(softplus(x * 8)) = mish(x*8) / 8
+    // CUDA: mishf_scale8(a) = a < 2.5f ? a * tanhf(log1pf(expf(a*8.0f))) : a
+    // Implementation: scale by 8, apply mish, scale by 1/8
+    else if(activation == ACTIVATION_MISH_SCALE8) {
+      vector<int64_t> outputShape = {batchSize, numChannels, nnYLen, nnXLen};
+      aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
 
-      // For ACTIVATION_MISH_SCALE8, scale the output by 8.0
-      if(activation == ACTIVATION_MISH_SCALE8) {
-        aclScalar* scaleScalar = createFloatScalar(8.0f);
+      float scale8 = 8.0f;
+      float invScale8 = 0.125f;
+      aclnnStatus status;
 
-        uint64_t mulWsSize = 0;
-        aclOpExecutor* mulExecutor = nullptr;
-
-        status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, scaleScalar, &mulWsSize, &mulExecutor);
-        if(status != ACLNN_SUCCESS) {
-          aclDestroyScalar(scaleScalar);
-          throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
-        }
-
-        status = aclnnInplaceMuls(workspaceBuf, mulWsSize, mulExecutor, stream);
-        aclDestroyScalar(scaleScalar);
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 " + name + " with error: " + to_string(status));
-        }
+      // Step 1: multiply by 8
+      aclScalar* scale8Scalar = createFloatScalar(scale8);
+      uint64_t wsSize = 0;
+      aclOpExecutor* executor = nullptr;
+      status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, scale8Scalar, &wsSize, &executor);
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyScalar(scale8Scalar);
+        throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 step1 in BatchNorm " + name + ": " + to_string(status));
       }
+      status = aclnnInplaceMuls(workspaceBuf, wsSize, executor, stream);
+      aclDestroyScalar(scale8Scalar);
+      if(status != ACLNN_SUCCESS)
+        throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 step1 in BatchNorm " + name + ": " + to_string(status));
+
+      // Step 2: apply mish
+      wsSize = 0;
+      executor = nullptr;
+      status = aclnnInplaceMishGetWorkspaceSize(outputTensor, &wsSize, &executor);
+      if(status != ACLNN_SUCCESS)
+        throw StringError("aclnnInplaceMishGetWorkspaceSize failed for MISH_SCALE8 in BatchNorm " + name + ": " + to_string(status));
+      status = aclnnInplaceMish(workspaceBuf, wsSize, executor, stream);
+      if(status != ACLNN_SUCCESS)
+        throw StringError("aclnnInplaceMish failed for MISH_SCALE8 in BatchNorm " + name + ": " + to_string(status));
+
+      // Step 3: divide by 8
+      aclScalar* invScale8Scalar = createFloatScalar(invScale8);
+      wsSize = 0;
+      executor = nullptr;
+      status = aclnnInplaceMulsGetWorkspaceSize(outputTensor, invScale8Scalar, &wsSize, &executor);
+      if(status != ACLNN_SUCCESS) {
+        aclDestroyScalar(invScale8Scalar);
+        throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 step3 in BatchNorm " + name + ": " + to_string(status));
+      }
+      status = aclnnInplaceMuls(workspaceBuf, wsSize, executor, stream);
+      aclDestroyScalar(invScale8Scalar);
+      if(status != ACLNN_SUCCESS)
+        throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 step3 in BatchNorm " + name + ": " + to_string(status));
     }
 
     // Step 4: Apply mask if provided
@@ -1614,11 +1643,99 @@ struct MatMulLayer {
   }
 };
 
-// MatBiasLayer - bias addition + optional activation
+// Apply activation in-place on a (N, C) shaped buffer
+// Matches Eigen backend's ActivationLayer::apply behavior
+static void applyActivationToNC(
+  ComputeHandle* handle,
+  aclrtStream stream,
+  void* buf, int batchSize, int numChannels,
+  int activation, bool useFP16,
+  void* workspaceBuf, size_t workspaceBytes
+) {
+  if(activation == ACTIVATION_IDENTITY)
+    return;
+
+  aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+  vector<int64_t> shape = {batchSize, numChannels};
+  aclTensor* tensor = handle->tensorCache.get(buf, shape, dtype, ACL_FORMAT_ND);
+
+  aclnnStatus status;
+
+  if(activation == ACTIVATION_RELU) {
+    uint64_t wsSize = 0;
+    aclOpExecutor* executor = nullptr;
+    status = aclnnInplaceReluGetWorkspaceSize(tensor, &wsSize, &executor);
+    if(status != ACLNN_SUCCESS || wsSize > workspaceBytes)
+      throw StringError("aclnnInplaceReluGetWorkspaceSize failed: " + to_string(status) + " ws=" + to_string(wsSize));
+    status = aclnnInplaceRelu(workspaceBuf, wsSize, executor, stream);
+    if(status != ACLNN_SUCCESS)
+      throw StringError("aclnnInplaceRelu failed: " + to_string(status));
+  }
+  else if(activation == ACTIVATION_MISH) {
+    uint64_t wsSize = 0;
+    aclOpExecutor* executor = nullptr;
+    status = aclnnInplaceMishGetWorkspaceSize(tensor, &wsSize, &executor);
+    if(status != ACLNN_SUCCESS || wsSize > workspaceBytes)
+      throw StringError("aclnnInplaceMishGetWorkspaceSize failed: " + to_string(status) + " ws=" + to_string(wsSize));
+    status = aclnnInplaceMish(workspaceBuf, wsSize, executor, stream);
+    if(status != ACLNN_SUCCESS)
+      throw StringError("aclnnInplaceMish failed: " + to_string(status));
+  }
+  else if(activation == ACTIVATION_MISH_SCALE8) {
+    // mish_scale8(x) = x * tanh(ln(1 + exp(x * 8))) = mish(x * 8) / 8
+    // CUDA implementation: a < 2.5f ? a * tanhf(log1pf(expf(a*8.0f))) : a
+    // Steps: scale by 8, apply mish, scale by 1/8
+    float scale8 = 8.0f;
+    float invScale8 = 0.125f;
+
+    // Step 1: multiply by 8
+    aclScalar* scale8Scalar = aclCreateScalar(&scale8, dtype);
+    uint64_t wsSize = 0;
+    aclOpExecutor* executor = nullptr;
+    status = aclnnInplaceMulsGetWorkspaceSize(tensor, scale8Scalar, &wsSize, &executor);
+    if(status != ACLNN_SUCCESS || wsSize > workspaceBytes) {
+      aclDestroyScalar(scale8Scalar);
+      throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 step1: " + to_string(status));
+    }
+    status = aclnnInplaceMuls(workspaceBuf, wsSize, executor, stream);
+    aclDestroyScalar(scale8Scalar);
+    if(status != ACLNN_SUCCESS)
+      throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 step1: " + to_string(status));
+
+    // Step 2: apply mish
+    wsSize = 0;
+    executor = nullptr;
+    status = aclnnInplaceMishGetWorkspaceSize(tensor, &wsSize, &executor);
+    if(status != ACLNN_SUCCESS || wsSize > workspaceBytes)
+      throw StringError("aclnnInplaceMishGetWorkspaceSize failed for MISH_SCALE8: " + to_string(status));
+    status = aclnnInplaceMish(workspaceBuf, wsSize, executor, stream);
+    if(status != ACLNN_SUCCESS)
+      throw StringError("aclnnInplaceMish failed for MISH_SCALE8: " + to_string(status));
+
+    // Step 3: divide by 8
+    aclScalar* invScale8Scalar = aclCreateScalar(&invScale8, dtype);
+    wsSize = 0;
+    executor = nullptr;
+    status = aclnnInplaceMulsGetWorkspaceSize(tensor, invScale8Scalar, &wsSize, &executor);
+    if(status != ACLNN_SUCCESS || wsSize > workspaceBytes) {
+      aclDestroyScalar(invScale8Scalar);
+      throw StringError("aclnnInplaceMulsGetWorkspaceSize failed for MISH_SCALE8 step3: " + to_string(status));
+    }
+    status = aclnnInplaceMuls(workspaceBuf, wsSize, executor, stream);
+    aclDestroyScalar(invScale8Scalar);
+    if(status != ACLNN_SUCCESS)
+      throw StringError("aclnnInplaceMuls failed for MISH_SCALE8 step3: " + to_string(status));
+  }
+  else {
+    throw StringError("Unsupported activation: " + to_string(activation));
+  }
+}
+
+// MatBiasLayer - bias addition only (no activation)
+// Activation is applied separately via applyActivationToNC, matching Eigen backend
 struct MatBiasLayer {
   const string name;
   const int numChannels;
-  const int activation;  // 0=IDENTITY, 1=RELU, 2=MISH, 3=MISH_SCALE8
 
   void* biasBuf;  // Device memory for bias
   bool useFP16;
@@ -1627,10 +1744,9 @@ struct MatBiasLayer {
   MatBiasLayer(const MatBiasLayer&) = delete;
   MatBiasLayer& operator=(const MatBiasLayer&) = delete;
 
-  MatBiasLayer(const MatBiasLayerDesc* desc, bool useFP16_, int activation_ = 0)
+  MatBiasLayer(const MatBiasLayerDesc* desc, bool useFP16_)
     : name(desc->name),
       numChannels(desc->numChannels),
-      activation(activation_),
       useFP16(useFP16_)
   {
     // Allocate and copy bias with native FP16 conversion
@@ -1692,48 +1808,6 @@ struct MatBiasLayer {
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for MatBias " + name + " with error: " + to_string(status));
-    }
-
-    // Apply activation if specified (RELU, MISH, MISH_SCALE8)
-    if(activation != 0) {
-      aclTensor* actTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
-      if(activation == 1) {
-        uint64_t reluWsSize = 0;
-        aclOpExecutor* reluExecutor = nullptr;
-        status = aclnnInplaceReluGetWorkspaceSize(actTensor, &reluWsSize, &reluExecutor);
-        if(status == ACLNN_SUCCESS && reluWsSize <= workspaceBytes) {
-          status = aclnnInplaceRelu(workspaceBuf, reluWsSize, reluExecutor, stream);
-        }
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnInplaceRelu failed for MatBias " + name + ": " + to_string(status));
-        }
-      }
-      else if(activation == 2 || activation == 3) {
-        uint64_t mishWsSize = 0;
-        aclOpExecutor* mishExecutor = nullptr;
-        status = aclnnInplaceMishGetWorkspaceSize(actTensor, &mishWsSize, &mishExecutor);
-        if(status == ACLNN_SUCCESS && mishWsSize <= workspaceBytes) {
-          status = aclnnInplaceMish(workspaceBuf, mishWsSize, mishExecutor, stream);
-        }
-        if(status != ACLNN_SUCCESS) {
-          throw StringError("aclnnInplaceMish failed for MatBias " + name + ": " + to_string(status));
-        }
-        if(activation == 3) {
-          // MISH_SCALE8: mish(x) * 8
-          float scale8 = 8.0f;
-          aclScalar* scale8Scalar = aclCreateScalar(&scale8, dtype);
-          uint64_t mulsWsSize = 0;
-          aclOpExecutor* mulsExecutor = nullptr;
-          status = aclnnMulsGetWorkspaceSize(actTensor, scale8Scalar, actTensor, &mulsWsSize, &mulsExecutor);
-          if(status == ACLNN_SUCCESS && mulsWsSize <= workspaceBytes) {
-            status = aclnnMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
-          }
-          aclDestroyScalar(scale8Scalar);
-          if(status != ACLNN_SUCCESS) {
-            throw StringError("aclnnMuls failed for MISH_SCALE8 in MatBias " + name + ": " + to_string(status));
-          }
-        }
-      }
     }
   }
 };
@@ -2461,6 +2535,7 @@ struct Model {
   unique_ptr<ConvLayer> p2Conv;
   unique_ptr<MatMulLayer> gpoolToPassMul;
   unique_ptr<MatBiasLayer> gpoolToPassBias;
+  int passActivationType;  // Activation type for gpoolToPassBias
   unique_ptr<MatMulLayer> gpoolToPassMul2;
 
   // Value head layers
@@ -2468,6 +2543,7 @@ struct Model {
   unique_ptr<BatchNormLayer> v1BN;
   unique_ptr<MatMulLayer> v2Mul;
   unique_ptr<MatBiasLayer> v2Bias;
+  int v2ActivationType;  // Activation type for v2Bias
   unique_ptr<MatMulLayer> v3Mul;
   unique_ptr<MatBiasLayer> v3Bias;
   unique_ptr<MatMulLayer> sv3Mul;
@@ -2478,8 +2554,10 @@ struct Model {
   bool hasMetadataEncoder;
   unique_ptr<MatMulLayer> metaMul1;
   unique_ptr<MatBiasLayer> metaBias1;
+  int metaAct1Type;  // Activation type for metaBias1
   unique_ptr<MatMulLayer> metaMul2;
   unique_ptr<MatBiasLayer> metaBias2;
+  int metaAct2Type;  // Activation type for metaBias2
   unique_ptr<MatMulLayer> metaMul3;
 
   Model(const ModelDesc& desc, int nnX, int nnY, bool fp16);
@@ -2606,7 +2684,8 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   p1BN = make_unique<BatchNormLayer>(&desc.policyHead.p1BN, &desc.policyHead.p1Activation, nnX, nnY, false);  // ALWAYS FP32
   p2Conv = make_unique<ConvLayer>(&desc.policyHead.p2Conv, false);  // ALWAYS FP32
   gpoolToPassMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul, false);  // ALWAYS FP32
-  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, false, desc.policyHead.passActivation.activation);
+  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, false);  // ALWAYS FP32
+  passActivationType = desc.policyHead.passActivation.activation;
   gpoolToPassMul2 = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul2, false);  // ALWAYS FP32
 
   // Create value head layers
@@ -2618,7 +2697,8 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   v1Conv = make_unique<ConvLayer>(&desc.valueHead.v1Conv, fp16);
   v1BN = make_unique<BatchNormLayer>(&desc.valueHead.v1BN, &desc.valueHead.v1Activation, nnX, nnY, fp16);
   v2Mul = make_unique<MatMulLayer>(&desc.valueHead.v2Mul, false);  // ALWAYS FP32
-  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, false, desc.valueHead.v2Activation.activation);
+  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, false);  // ALWAYS FP32
+  v2ActivationType = desc.valueHead.v2Activation.activation;
   v3Mul = make_unique<MatMulLayer>(&desc.valueHead.v3Mul, false);  // ALWAYS FP32
   v3Bias = make_unique<MatBiasLayer>(&desc.valueHead.v3Bias, false);  // ALWAYS FP32
   sv3Mul = make_unique<MatMulLayer>(&desc.valueHead.sv3Mul, false);  // ALWAYS FP32
@@ -2629,9 +2709,11 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   if(hasMetadataEncoder && desc.trunk.sgfMetadataEncoder.metaEncoderVersion > 0) {
     const auto& meta = desc.trunk.sgfMetadataEncoder;
     metaMul1 = make_unique<MatMulLayer>(&meta.mul1, fp16);
-    metaBias1 = make_unique<MatBiasLayer>(&meta.bias1, fp16, meta.act1.activation);
+    metaBias1 = make_unique<MatBiasLayer>(&meta.bias1, fp16);
+    metaAct1Type = meta.act1.activation;
     metaMul2 = make_unique<MatMulLayer>(&meta.mul2, fp16);
-    metaBias2 = make_unique<MatBiasLayer>(&meta.bias2, fp16, meta.act2.activation);
+    metaBias2 = make_unique<MatBiasLayer>(&meta.bias2, fp16);
+    metaAct2Type = meta.act2.activation;
     metaMul3 = make_unique<MatMulLayer>(&meta.mul3, fp16);
   }
 }
@@ -2885,12 +2967,16 @@ void Model::applyTrunk(
 
     // mul1: (batch, metaIn) -> (batch, internal1)
     metaMul1->apply(handle, stream, batchSize, inputMetaBuf, metaBuf1, workspaceBuf, workspaceBytes);
-    // bias1: in-place bias + activation on metaBuf1
+    // bias1: in-place bias on metaBuf1
     metaBias1->apply(handle, stream, batchSize, metaBuf1, metaBuf1, workspaceBuf, workspaceBytes);
+    // activation1: in-place activation on metaBuf1
+    applyActivationToNC(handle, stream, metaBuf1, batchSize, metaMul1->outChannels, metaAct1Type, useFP16, workspaceBuf, workspaceBytes);
     // mul2: (batch, internal1) -> (batch, internal2)
     metaMul2->apply(handle, stream, batchSize, metaBuf1, metaBuf2, workspaceBuf, workspaceBytes);
-    // bias2: in-place bias + activation on metaBuf2
+    // bias2: in-place bias on metaBuf2
     metaBias2->apply(handle, stream, batchSize, metaBuf2, metaBuf2, workspaceBuf, workspaceBytes);
+    // activation2: in-place activation on metaBuf2
+    applyActivationToNC(handle, stream, metaBuf2, batchSize, metaMul2->outChannels, metaAct2Type, useFP16, workspaceBuf, workspaceBytes);
     // mul3: (batch, internal2) -> (batch, trunkChannels)
     metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
 
@@ -3146,6 +3232,7 @@ void Model::applyPolicyHead(
   if(modelVersion >= 15) {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
     gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
+    applyActivationToNC(handle, stream, p1PassBuf, batchSize, gpoolToPassBias->numChannels, passActivationType, false, workspaceBuf, workspaceBytes);
     gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   } else {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
@@ -3294,6 +3381,8 @@ void Model::applyValueHead(
 
   // Step 5: v2Bias: v2Out -> v2Out (in-place, ALWAYS FP32)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
+  // Step 5b: v2Activation: in-place activation on v2Out
+  applyActivationToNC(handle, stream, v2OutBuf, batchSize, v2Mul->outChannels, v2ActivationType, false, workspaceBuf, workspaceBytes);
 
   // Step 6-7: v3Mul + v3Bias: v2Out -> valueBuf (ALWAYS FP32)
   v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
