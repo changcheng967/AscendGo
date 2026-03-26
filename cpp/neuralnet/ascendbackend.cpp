@@ -2849,7 +2849,7 @@ void Model::apply(
   void* workspaceBuf = buffers->workspaceBuf;
   size_t workspaceBytes = buffers->workspaceBytes;
 
-  fprintf(stderr, "ASCEND: Model::apply batch=%d\n", batchSize);
+  // fprintf(stderr, "ASCEND: Model::apply batch=%d\n", batchSize);
 
   // ================================================================
   // Step 1: Extract mask from input channel 0 and compute maskSum
@@ -2956,23 +2956,23 @@ void Model::apply(
   // ================================================================
   // Step 2: Apply trunk
   // ================================================================
-  fprintf(stderr, "ASCEND: Step 2 applyTrunk start\n");
+  // fprintf(stderr, "ASCEND: Step 2 applyTrunk start\n");
   applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, maskSumBuf, scratchBuf, workspaceBuf, workspaceBytes);
-  fprintf(stderr, "ASCEND: Step 2 applyTrunk done\n");
+  // fprintf(stderr, "ASCEND: Step 2 applyTrunk done\n");
 
   // ================================================================
   // Step 3: Apply policy head
   // ================================================================
-  fprintf(stderr, "ASCEND: Step 3 applyPolicyHead start\n");
+  // fprintf(stderr, "ASCEND: Step 3 applyPolicyHead start\n");
   applyPolicyHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, buffers->maskFloatBuf, maskSumBuf, policyPassBuf, policyBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
-  fprintf(stderr, "ASCEND: Step 3 applyPolicyHead done\n");
+  // fprintf(stderr, "ASCEND: Step 3 applyPolicyHead done\n");
 
   // ================================================================
   // Step 4: Apply value head
   // ================================================================
-  fprintf(stderr, "ASCEND: Step 4 applyValueHead start\n");
+  // fprintf(stderr, "ASCEND: Step 4 applyValueHead start\n");
   applyValueHead(handle, stream, batchSize, trunkOutputBuf, maskBuf, maskSumBuf, valueBuf, scoreValueBuf, ownershipBuf, scratchBuf, workspaceBuf, workspaceBytes, buffers);
-  fprintf(stderr, "ASCEND: Step 4 applyValueHead done\n");
+  // fprintf(stderr, "ASCEND: Step 4 applyValueHead done\n");
 }
 
 void Model::applyTrunk(
@@ -2998,14 +2998,11 @@ void Model::applyTrunk(
   // 4. trunkTipBN: scratchBuf -> trunkOutputBuf
 
   // Step 1: Initial conv -> scratchBuf
-  fprintf(stderr, "ASCEND:   trunk initialConv start\n");
   initialConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, inputBuf, scratchBuf, workspaceBuf, workspaceBytes);
-  fprintf(stderr, "ASCEND:   trunk initialConv done\n");
 
   // Step 2: Initial matmul -> trunkOutputBuf
-  fprintf(stderr, "ASCEND:   trunk initialMatMul start\n");
+  // fprintf(stderr, "ASCEND:   trunk initialMatMul start\n");
   initialMatMul->apply(handle, stream, batchSize, inputGlobalBuf, trunkOutputBuf, workspaceBuf, workspaceBytes);
-  fprintf(stderr, "ASCEND:   trunk initialMatMul done\n");
 
   // Broadcast-add: scratchBuf += trunkOutputBuf reshaped as (N, C, 1, 1)
   {
@@ -3026,7 +3023,7 @@ void Model::applyTrunk(
       throw StringError("aclnnAdd failed for initial global features: " + to_string(status));
     }
   }
-  fprintf(stderr, "ASCEND:   trunk broadcast-add done, numBlocks=%zu\n", trunkBlockKinds.size());
+  // fprintf(stderr, "ASCEND:   trunk broadcast-add done, numBlocks=%zu\n", trunkBlockKinds.size());
 
   // TODO: Handle metadata features if present
   (void)inputMetaBuf;
@@ -3044,7 +3041,7 @@ void Model::applyTrunk(
     int gpoolIdx = 0;
     int nestedIdx = 0;
     for(int i = 0; i < (int)trunkBlockKinds.size(); i++) {
-      fprintf(stderr, "ASCEND:   trunk block %d kind=%d start\n", i, trunkBlockKinds[i]);
+      // fprintf(stderr, "ASCEND:   trunk block %d kind=%d start\n", i, trunkBlockKinds[i]);
       switch(trunkBlockKinds[i]) {
       case ORDINARY_BLOCK_KIND:
         residualBlocks[regularIdx]->apply(
