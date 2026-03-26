@@ -2823,14 +2823,51 @@ void Model::applyTrunk(
   }
   // fprintf(stderr, "ASCEND:   trunk broadcast-add done, numBlocks=%zu\n", trunkBlockKinds.size());
 
-  // TODO: Handle metadata features if present
-  (void)inputMetaBuf;
-  (void)hasMetadataEncoder;
-  (void)metaMul1;
-  (void)metaBias1;
-  (void)metaMul2;
-  (void)metaBias2;
-  (void)metaMul3;
+  // Step 2b: Metadata encoder (if present)
+  // Like CUDA: mul1(meta) -> bias1(act) -> mul2 -> bias2(act) -> mul3 -> broadcast-add to trunk
+  if(hasMetadataEncoder && metaMul3 != nullptr) {
+    int metaInternalChannels = std::max(metaMul1->outChannels, metaMul2->outChannels);
+    int trunkChannels = initialConv->outChannels;
+
+    size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
+    size_t metaInternalBytes = (size_t)batchSize * metaInternalChannels * eltSize;
+    size_t metaOutputBytes = (size_t)batchSize * trunkChannels * eltSize;
+
+    void* metaBuf1 = ascendMalloc(metaInternalBytes);
+    void* metaBuf2 = ascendMalloc(metaInternalBytes);
+    void* metaOutput = ascendMalloc(metaOutputBytes);
+
+    aclDataType metaDtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+
+    // mul1: (batch, metaIn) -> (batch, internal1)
+    metaMul1->apply(handle, stream, batchSize, inputMetaBuf, metaBuf1, workspaceBuf, workspaceBytes);
+    // bias1: in-place bias + activation on metaBuf1
+    metaBias1->apply(handle, stream, batchSize, metaBuf1, workspaceBuf, workspaceBytes);
+    // mul2: (batch, internal1) -> (batch, internal2)
+    metaMul2->apply(handle, stream, batchSize, metaBuf1, metaBuf2, workspaceBuf, workspaceBytes);
+    // bias2: in-place bias + activation on metaBuf2
+    metaBias2->apply(handle, stream, batchSize, metaBuf2, workspaceBuf, workspaceBytes);
+    // mul3: (batch, internal2) -> (batch, trunkChannels)
+    metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
+
+    // Broadcast-add metaOutput (batch, trunkChannels, 1, 1) to scratchBuf (batch, trunkChannels, H, W)
+    aclTensor* trunkTensor = handle->tensorCache.get(scratchBuf, {(int64_t)batchSize, (int64_t)trunkChannels, (int64_t)nnYLen, (int64_t)nnXLen}, metaDtype, ACL_FORMAT_ND);
+    aclTensor* metaOutTensor = handle->tensorCache.get(metaOutput, {(int64_t)batchSize, (int64_t)trunkChannels, 1, 1}, metaDtype, ACL_FORMAT_ND);
+    aclTensor* trunkResultTensor = handle->tensorCache.get(scratchBuf, {(int64_t)batchSize, (int64_t)trunkChannels, (int64_t)nnYLen, (int64_t)nnXLen}, metaDtype, ACL_FORMAT_ND);
+
+    uint64_t metaAddWsSize = 0;
+    aclOpExecutor* metaAddExecutor = nullptr;
+    aclnnStatus metaStatus = aclnnAddGetWorkspaceSize(trunkTensor, metaOutTensor, handle->alphaOneScalar, trunkResultTensor, &metaAddWsSize, &metaAddExecutor);
+    if(metaStatus == ACLNN_SUCCESS && metaAddWsSize <= workspaceBytes) {
+      metaStatus = aclnnAdd(workspaceBuf, metaAddWsSize, metaAddExecutor, stream);
+    }
+    ascendFree(metaBuf1);
+    ascendFree(metaBuf2);
+    ascendFree(metaOutput);
+    if(metaStatus != ACLNN_SUCCESS) {
+      throw StringError("aclnnAdd failed for metadata encoder: " + to_string(metaStatus));
+    }
+  }
 
   // Step 3: Trunk blocks (Residual + GlobalPooling + NestedBottleneck)
   // Use scratch allocator for mid buffers (like CUDA backend)
