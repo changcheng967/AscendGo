@@ -1614,10 +1614,11 @@ struct MatMulLayer {
   }
 };
 
-// MatBiasLayer - bias addition
+// MatBiasLayer - bias addition + optional activation
 struct MatBiasLayer {
   const string name;
   const int numChannels;
+  const int activation;  // 0=IDENTITY, 1=RELU, 2=MISH, 3=MISH_SCALE8
 
   void* biasBuf;  // Device memory for bias
   bool useFP16;
@@ -1626,9 +1627,10 @@ struct MatBiasLayer {
   MatBiasLayer(const MatBiasLayer&) = delete;
   MatBiasLayer& operator=(const MatBiasLayer&) = delete;
 
-  MatBiasLayer(const MatBiasLayerDesc* desc, bool useFP16_)
+  MatBiasLayer(const MatBiasLayerDesc* desc, bool useFP16_, int activation_ = 0)
     : name(desc->name),
       numChannels(desc->numChannels),
+      activation(activation_),
       useFP16(useFP16_)
   {
     // Allocate and copy bias with native FP16 conversion
@@ -1690,6 +1692,48 @@ struct MatBiasLayer {
 
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for MatBias " + name + " with error: " + to_string(status));
+    }
+
+    // Apply activation if specified (RELU, MISH, MISH_SCALE8)
+    if(activation != 0) {
+      aclTensor* actTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_ND);
+      if(activation == 1) {
+        uint64_t reluWsSize = 0;
+        aclOpExecutor* reluExecutor = nullptr;
+        status = aclnnInplaceReluGetWorkspaceSize(actTensor, &reluWsSize, &reluExecutor);
+        if(status == ACLNN_SUCCESS && reluWsSize <= workspaceBytes) {
+          status = aclnnInplaceRelu(workspaceBuf, reluWsSize, reluExecutor, stream);
+        }
+        if(status != ACLNN_SUCCESS) {
+          throw StringError("aclnnInplaceRelu failed for MatBias " + name + ": " + to_string(status));
+        }
+      }
+      else if(activation == 2 || activation == 3) {
+        uint64_t mishWsSize = 0;
+        aclOpExecutor* mishExecutor = nullptr;
+        status = aclnnInplaceMishGetWorkspaceSize(actTensor, &mishWsSize, &mishExecutor);
+        if(status == ACLNN_SUCCESS && mishWsSize <= workspaceBytes) {
+          status = aclnnInplaceMish(workspaceBuf, mishWsSize, mishExecutor, stream);
+        }
+        if(status != ACLNN_SUCCESS) {
+          throw StringError("aclnnInplaceMish failed for MatBias " + name + ": " + to_string(status));
+        }
+        if(activation == 3) {
+          // MISH_SCALE8: mish(x) * 8
+          float scale8 = 8.0f;
+          aclScalar* scale8Scalar = aclCreateScalar(&scale8, dtype);
+          uint64_t mulsWsSize = 0;
+          aclOpExecutor* mulsExecutor = nullptr;
+          status = aclnnMulsGetWorkspaceSize(actTensor, scale8Scalar, actTensor, &mulsWsSize, &mulsExecutor);
+          if(status == ACLNN_SUCCESS && mulsWsSize <= workspaceBytes) {
+            status = aclnnMuls(workspaceBuf, mulsWsSize, mulsExecutor, stream);
+          }
+          aclDestroyScalar(scale8Scalar);
+          if(status != ACLNN_SUCCESS) {
+            throw StringError("aclnnMuls failed for MISH_SCALE8 in MatBias " + name + ": " + to_string(status));
+          }
+        }
+      }
     }
   }
 };
@@ -2562,7 +2606,7 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   p1BN = make_unique<BatchNormLayer>(&desc.policyHead.p1BN, &desc.policyHead.p1Activation, nnX, nnY, false);  // ALWAYS FP32
   p2Conv = make_unique<ConvLayer>(&desc.policyHead.p2Conv, false);  // ALWAYS FP32
   gpoolToPassMul = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul, false);  // ALWAYS FP32
-  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, false);  // ALWAYS FP32
+  gpoolToPassBias = make_unique<MatBiasLayer>(&desc.policyHead.gpoolToPassBias, false, desc.policyHead.passActivation.activation);
   gpoolToPassMul2 = make_unique<MatMulLayer>(&desc.policyHead.gpoolToPassMul2, false);  // ALWAYS FP32
 
   // Create value head layers
@@ -2574,7 +2618,7 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   v1Conv = make_unique<ConvLayer>(&desc.valueHead.v1Conv, fp16);
   v1BN = make_unique<BatchNormLayer>(&desc.valueHead.v1BN, &desc.valueHead.v1Activation, nnX, nnY, fp16);
   v2Mul = make_unique<MatMulLayer>(&desc.valueHead.v2Mul, false);  // ALWAYS FP32
-  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, false);  // ALWAYS FP32
+  v2Bias = make_unique<MatBiasLayer>(&desc.valueHead.v2Bias, false, desc.valueHead.v2Activation.activation);
   v3Mul = make_unique<MatMulLayer>(&desc.valueHead.v3Mul, false);  // ALWAYS FP32
   v3Bias = make_unique<MatBiasLayer>(&desc.valueHead.v3Bias, false);  // ALWAYS FP32
   sv3Mul = make_unique<MatMulLayer>(&desc.valueHead.sv3Mul, false);  // ALWAYS FP32
@@ -2585,9 +2629,9 @@ Model::Model(const ModelDesc& desc, int nnX, int nnY, bool fp16)
   if(hasMetadataEncoder && desc.trunk.sgfMetadataEncoder.metaEncoderVersion > 0) {
     const auto& meta = desc.trunk.sgfMetadataEncoder;
     metaMul1 = make_unique<MatMulLayer>(&meta.mul1, fp16);
-    metaBias1 = make_unique<MatBiasLayer>(&meta.bias1, fp16);
+    metaBias1 = make_unique<MatBiasLayer>(&meta.bias1, fp16, meta.act1.activation);
     metaMul2 = make_unique<MatMulLayer>(&meta.mul2, fp16);
-    metaBias2 = make_unique<MatBiasLayer>(&meta.bias2, fp16);
+    metaBias2 = make_unique<MatBiasLayer>(&meta.bias2, fp16, meta.act2.activation);
     metaMul3 = make_unique<MatMulLayer>(&meta.mul3, fp16);
   }
 }
