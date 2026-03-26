@@ -123,12 +123,21 @@ static aclTensor* createAclTensor(
   return tensor;
 }
 
-// Helper to create a scalar aclScalar
-static aclScalar* createAclScalar(float value, aclDataType dtype) {
-  return aclCreateScalar(&value, dtype);
+// Helper to create a scalar with correct dtype.
+// CRITICAL: The data pointer must point to a value of the specified dtype.
+// For ACL_FLOAT16, we must pass a pointer to aclFloat16, NOT float.
+// Passing float bytes to an FP16 scalar causes CANN to misinterpret the value
+// (e.g., 1.0f = 0x3F800000 reads as 0x0000 = 0.0 in FP16 on little-endian).
+static aclScalar* createScalar(float value, aclDataType dtype) {
+  if(dtype == ACL_FLOAT16) {
+    aclFloat16 valFP16 = aclFloatToFloat16(value);
+    return aclCreateScalar(&valFP16, ACL_FLOAT16);
+  } else {
+    return aclCreateScalar(&value, ACL_FLOAT);
+  }
 }
 
-// Helper to create a float scalar with ACL_FLOAT type
+// Convenience: create FP32 scalar (for use with FP32 tensors only)
 static aclScalar* createFloatScalar(float value) {
   return aclCreateScalar(&value, ACL_FLOAT);
 }
@@ -278,11 +287,9 @@ struct LoadedModel {
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
     ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
-    // modelDesc.applyScale8ToReduceActivations();
-    // TODO: Temporarily disabled - the applyScale8 transformation causes bad moves.
-    // Hypothesis: aclnnInplaceMuls with ACL_FLOAT scalar on FP16 tensors
-    // may not handle type promotion correctly in CANN 9.0.
-    // Need to verify MISH_SCALE8 with dtype-appropriate scalars first.
+    modelDesc.applyScale8ToReduceActivations();
+    // applyScale8 converts MISH->MISH_SCALE8, scales BN biases by 0.125,
+    // and sets outputScaleMultiplier*=8.0. All native backends call this.
   }
 
   LoadedModel() = delete;
@@ -465,8 +472,15 @@ struct ComputeHandle {
   // Cached tensor descriptors - eliminates per-eval create/destroy overhead
   TensorCache tensorCache;
 
-  // Cached alpha=1.0 scalar for Add operations
-  aclScalar* alphaOneScalar;
+  // Cached alpha=1.0 scalars for Add operations, one per dtype.
+  // CANN requires the scalar dtype to match the tensor dtype.
+  aclScalar* alphaOneScalarFP16;
+  aclScalar* alphaOneScalarFP32;
+
+  // Get the alpha=1.0 scalar matching the given tensor dtype
+  aclScalar* getAlphaOne(aclDataType dtype) const {
+    return (dtype == ACL_FLOAT16) ? alphaOneScalarFP16 : alphaOneScalarFP32;
+  }
 
   // Ping-pong buffer management for residual blocks
   // Instead of D2D copy, swap trunk/scratch pointers
@@ -487,7 +501,8 @@ struct ComputeHandle {
       nnYLen(nnY),
       requireExactNNLen(exactLen),
       inputsUseNHWC(nhwc),
-      alphaOneScalar(nullptr),
+      alphaOneScalarFP16(nullptr),
+      alphaOneScalarFP32(nullptr),
       trunkIsPrimary(true)
   {
   }
@@ -497,8 +512,11 @@ struct ComputeHandle {
     // CANN's device binding is thread-local
     aclrtSetDevice(deviceIdx);
 
-    if(alphaOneScalar != nullptr) {
-      aclDestroyScalar(alphaOneScalar);
+    if(alphaOneScalarFP16 != nullptr) {
+      aclDestroyScalar(alphaOneScalarFP16);
+    }
+    if(alphaOneScalarFP32 != nullptr) {
+      aclDestroyScalar(alphaOneScalarFP32);
     }
     if(stream != nullptr) {
       aclrtDestroyStream(stream);
@@ -510,8 +528,11 @@ struct ComputeHandle {
   }
 
   void initScalars() {
-    if(alphaOneScalar == nullptr) {
-      alphaOneScalar = createFloatScalar(1.0f);
+    if(alphaOneScalarFP16 == nullptr) {
+      alphaOneScalarFP16 = createScalar(1.0f, ACL_FLOAT16);
+    }
+    if(alphaOneScalarFP32 == nullptr) {
+      alphaOneScalarFP32 = createFloatScalar(1.0f);
     }
   }
 };
@@ -1428,7 +1449,7 @@ struct BatchNormLayer {
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
 
-      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &addWsSize, &addExecutor);
+      aclnnStatus status = aclnnAddGetWorkspaceSize(outputTensor, biasTensor, handle->getAlphaOne(dtype), outputTensor, &addWsSize, &addExecutor);
       if(status != ACLNN_SUCCESS) {
         throw StringError("aclnnAddGetWorkspaceSize failed for BatchNorm " + name + " with error: " + to_string(status));
       }
@@ -1484,7 +1505,7 @@ struct BatchNormLayer {
       aclTensor* outputTensor = handle->tensorCache.get(outputBuf, outputShape, dtype, ACL_FORMAT_NCHW);
 
       // Step 1: Scale by 8
-      aclScalar* scale8Scalar = createFloatScalar(8.0f);
+      aclScalar* scale8Scalar = createScalar(8.0f, dtype);
       uint64_t mulsWsSize = 0;
       aclOpExecutor* mulsExecutor = nullptr;
 
@@ -1515,7 +1536,7 @@ struct BatchNormLayer {
       }
 
       // Step 3: Scale by 1/8 (0.125)
-      aclScalar* invScale8Scalar = createFloatScalar(0.125f);
+      aclScalar* invScale8Scalar = createScalar(0.125f, dtype);
       uint64_t mulWsSize = 0;
       aclOpExecutor* mulExecutor = nullptr;
 
@@ -1699,7 +1720,7 @@ static void applyActivationToNC(
     float invScale8 = 0.125f;
 
     // Step 1: multiply by 8
-    aclScalar* scale8Scalar = aclCreateScalar(&scale8, dtype);
+    aclScalar* scale8Scalar = createScalar(scale8, dtype);
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
     status = aclnnInplaceMulsGetWorkspaceSize(tensor, scale8Scalar, &wsSize, &executor);
@@ -1723,7 +1744,7 @@ static void applyActivationToNC(
       throw StringError("aclnnInplaceMish failed for MISH_SCALE8: " + to_string(status));
 
     // Step 3: divide by 8
-    aclScalar* invScale8Scalar = aclCreateScalar(&invScale8, dtype);
+    aclScalar* invScale8Scalar = createScalar(invScale8, dtype);
     wsSize = 0;
     executor = nullptr;
     status = aclnnInplaceMulsGetWorkspaceSize(tensor, invScale8Scalar, &wsSize, &executor);
@@ -1803,7 +1824,7 @@ struct MatBiasLayer {
     uint64_t wsSize = 0;
     aclOpExecutor* executor = nullptr;
 
-    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, handle->alphaOneScalar, outputTensor, &wsSize, &executor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(inputTensor, biasTensor, handle->getAlphaOne(dtype), outputTensor, &wsSize, &executor);
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAddGetWorkspaceSize failed for MatBias " + name + " with error: " + to_string(status));
     }
@@ -1948,7 +1969,7 @@ struct ResidualBlock {
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-    aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->getAlphaOne(dtype), resultTensor, &addWsSize, &addExecutor);
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
@@ -2210,7 +2231,7 @@ struct GlobalPoolingResidualBlock {
 
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
-      aclnnStatus addStatus = aclnnAddGetWorkspaceSize(regularOutTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+      aclnnStatus addStatus = aclnnAddGetWorkspaceSize(regularOutTensor, biasTensor, handle->getAlphaOne(dtype), resultTensor, &addWsSize, &addExecutor);
       if(addStatus == ACLNN_SUCCESS) {
         addStatus = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
       }
@@ -2233,7 +2254,7 @@ struct GlobalPoolingResidualBlock {
 
       uint64_t addWsSize = 0;
       aclOpExecutor* addExecutor = nullptr;
-      aclnnStatus status = aclnnAddGetWorkspaceSize(midOutTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+      aclnnStatus status = aclnnAddGetWorkspaceSize(midOutTensor, trunkTensor, handle->getAlphaOne(dtype), resultTensor, &addWsSize, &addExecutor);
       if(status == ACLNN_SUCCESS) {
         status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
       }
@@ -2490,7 +2511,7 @@ void NestedBottleneckResidualBlock::apply(
 
   uint64_t addWsSize = 0;
   aclOpExecutor* addExecutor = nullptr;
-  aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+  aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->getAlphaOne(dtype), resultTensor, &addWsSize, &addExecutor);
   if(status != ACLNN_SUCCESS) {
     throw StringError("aclnnAddGetWorkspaceSize failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
   }
@@ -2949,7 +2970,7 @@ void Model::applyTrunk(
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-    aclnnStatus status = aclnnAddGetWorkspaceSize(scratchTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(scratchTensor, biasTensor, handle->getAlphaOne(dtype), resultTensor, &addWsSize, &addExecutor);
     if(status == ACLNN_SUCCESS) {
       status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
     }
@@ -2979,13 +3000,14 @@ void Model::applyTrunk(
     metaMul1->apply(handle, stream, batchSize, inputMetaBuf, metaBuf1, workspaceBuf, workspaceBytes);
     // bias1: in-place bias on metaBuf1
     metaBias1->apply(handle, stream, batchSize, metaBuf1, metaBuf1, workspaceBuf, workspaceBytes);
-    // TODO: activation1 should be applied here (metaAct1Type) but disabled for now
-    // to match the working Q15/F19/A18 baseline. Needs debugging of applyActivationToNC.
+    // activation1 after bias
+    applyActivationToNC(handle, stream, metaBuf1, batchSize, metaMul1->outChannels, metaAct1Type, useFP16, workspaceBuf, workspaceBytes);
     // mul2: (batch, internal1) -> (batch, internal2)
     metaMul2->apply(handle, stream, batchSize, metaBuf1, metaBuf2, workspaceBuf, workspaceBytes);
     // bias2: in-place bias on metaBuf2
     metaBias2->apply(handle, stream, batchSize, metaBuf2, metaBuf2, workspaceBuf, workspaceBytes);
-    // TODO: activation2 should be applied here (metaAct2Type) but disabled for now
+    // activation2 after bias
+    applyActivationToNC(handle, stream, metaBuf2, batchSize, metaMul2->outChannels, metaAct2Type, useFP16, workspaceBuf, workspaceBytes);
     // mul3: (batch, internal2) -> (batch, trunkChannels)
     metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
 
@@ -2996,7 +3018,7 @@ void Model::applyTrunk(
 
     uint64_t metaAddWsSize = 0;
     aclOpExecutor* metaAddExecutor = nullptr;
-    aclnnStatus metaStatus = aclnnAddGetWorkspaceSize(trunkTensor, metaOutTensor, handle->alphaOneScalar, trunkResultTensor, &metaAddWsSize, &metaAddExecutor);
+    aclnnStatus metaStatus = aclnnAddGetWorkspaceSize(trunkTensor, metaOutTensor, handle->getAlphaOne(metaDtype), trunkResultTensor, &metaAddWsSize, &metaAddExecutor);
     if(metaStatus == ACLNN_SUCCESS && metaAddWsSize <= workspaceBytes) {
       metaStatus = aclnnAdd(workspaceBuf, metaAddWsSize, metaAddExecutor, stream);
     }
@@ -3217,7 +3239,7 @@ void Model::applyPolicyHead(
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
+    aclnnStatus status = aclnnAddGetWorkspaceSize(p1OutTensor, biasTensor, handle->getAlphaOne(ACL_FLOAT), resultTensor, &addWsSize, &addExecutor);
     if(status == ACLNN_SUCCESS && addWsSize <= workspaceBytes) {
       status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
     }
@@ -3241,7 +3263,7 @@ void Model::applyPolicyHead(
   if(modelVersion >= 15) {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
     gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    // TODO: passActivation should be applied here (passActivationType) but disabled for now
+    applyActivationToNC(handle, stream, p1PassBuf, batchSize, gpoolToPassMul->outChannels, passActivationType, false, workspaceBuf, workspaceBytes);
     gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   } else {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
@@ -3390,7 +3412,7 @@ void Model::applyValueHead(
 
   // Step 5: v2Bias: v2Out -> v2Out (in-place, ALWAYS FP32)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
-  // TODO: v2Activation should be applied here (v2ActivationType) but disabled for now
+  applyActivationToNC(handle, stream, v2OutBuf, batchSize, v2Mul->outChannels, v2ActivationType, false, workspaceBuf, workspaceBytes);
 
   // Step 6-7: v3Mul + v3Bias: v2Out -> valueBuf (ALWAYS FP32)
   v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
