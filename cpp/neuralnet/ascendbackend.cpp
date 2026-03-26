@@ -241,22 +241,39 @@ static void* ascendMallocAndCopyFP16(const vector<float>& hostData) {
   return ascendMallocAndCopyFP16(hostData.data(), hostData.size());
 }
 
-// Device-side FP16 -> FP32 conversion (uses aclFloat16ToFloat from CANN 9.0)
-// Does D2H + host convert + H2D round trip. Use for small tensors only.
-// IMPORTANT: aclrtMemcpy (synchronous) blocks until the copy completes, but does NOT
-// wait for previous async operations on the stream. We must sync FIRST to ensure srcFP16
-// is ready before reading.
-static void castDeviceFP16ToFP32(aclrtStream stream, void* dstFP32, const void* srcFP16, size_t numElements) {
-  size_t fp16Bytes = numElements * sizeof(aclFloat16);
-  size_t fp32Bytes = numElements * sizeof(float);
-  vector<aclFloat16> hostFP16(numElements);
-  vector<float> hostFP32(numElements);
-  // Sync FIRST to ensure all prior stream ops (e.g. the FP16 compute that wrote srcFP16) are complete
-  aclrtSynchronizeStream(stream);
-  aclrtMemcpy(hostFP16.data(), fp16Bytes, srcFP16, fp16Bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-  for(size_t i = 0; i < numElements; i++)
-    hostFP32[i] = aclFloat16ToFloat(hostFP16[i]);
-  aclrtMemcpy(dstFP32, fp32Bytes, hostFP32.data(), fp32Bytes, ACL_MEMCPY_HOST_TO_DEVICE);
+// Device-side FP16 -> FP32 conversion using aclnnCast (pure D2D, no host round-trip)
+// Uses ACL_FORMAT_ND as required by aclnnCast. No stream sync needed - stays async.
+static void castDeviceFP16ToFP32(
+  aclrtStream stream,
+  void* dstFP32, const void* srcFP16, size_t numElements,
+  void* workspaceBuf, size_t workspaceBytes
+) {
+  if(numElements == 0) return;
+  // Flatten to 1D ND tensors - contiguous memory, format doesn't affect layout
+  aclTensor* srcTensor = createAclTensor(const_cast<void*>(srcFP16), {(int64_t)numElements}, ACL_FLOAT16, ACL_FORMAT_ND);
+  aclTensor* dstTensor = createAclTensor(dstFP32, {(int64_t)numElements}, ACL_FLOAT, ACL_FORMAT_ND);
+
+  uint64_t wsSize = 0;
+  aclOpExecutor* executor = nullptr;
+  aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &wsSize, &executor);
+  if(status != ACLNN_SUCCESS) {
+    destroyAclTensor(srcTensor);
+    destroyAclTensor(dstTensor);
+    throw StringError("aclnnCastGetWorkspaceSize failed: " + to_string(status));
+  }
+  if(wsSize > workspaceBytes) {
+    destroyAclTensor(srcTensor);
+    destroyAclTensor(dstTensor);
+    throw StringError("aclnnCast workspace insufficient: need " + to_string(wsSize) + " have " + to_string(workspaceBytes));
+  }
+  status = aclnnCast(workspaceBuf, wsSize, executor, stream);
+  if(status != ACLNN_SUCCESS) {
+    destroyAclTensor(srcTensor);
+    destroyAclTensor(dstTensor);
+    throw StringError("aclnnCast failed: " + to_string(status));
+  }
+  destroyAclTensor(srcTensor);
+  destroyAclTensor(dstTensor);
 }
 
 
@@ -2205,10 +2222,10 @@ struct GlobalPoolingResidualBlock {
         throw StringError("aclnnMean failed for gpool block mean pooling: " + to_string(status));
       }
 
-      // 4b: Cast mean to FP32 if needed (use host-side conversion, aclnnCast is unreliable in CANN 9.0)
+      // 4b: Cast mean to FP32 if needed (device-side aclnnCast, no host round-trip)
       aclTensor* meanFP32Tensor;
       if(useFP16) {
-        castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts);
+        castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts, workspaceBuf, workspaceBytes);
         meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       } else {
         meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -2229,10 +2246,10 @@ struct GlobalPoolingResidualBlock {
         throw StringError("aclnnAmax failed for gpool block max pooling: " + to_string(status));
       }
 
-      // 4d: Cast max to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
+      // 4d: Cast max to FP32 if needed (device-side aclnnCast)
       aclTensor* maxFP32Tensor;
       if(useFP16) {
-        castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts);
+        castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts, workspaceBuf, workspaceBytes);
         maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
       } else {
         maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, gpoolChannels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -2903,9 +2920,9 @@ void Model::apply(
     // maskFloatBuf is always float
     aclnnStatus status;
     if(useFP16) {
-      // Cast mask from FP16 to FP32 using host-side conversion (aclnnCast is broken)
+      // Cast mask from FP16 to FP32 (device-side aclnnCast)
       size_t numMaskElts = (size_t)batchSize * nnYLen * nnXLen;
-      castDeviceFP16ToFP32(stream, maskFloatBuf, maskBuf, numMaskElts);
+      castDeviceFP16ToFP32(stream, buffers->maskFloatBuf, maskBuf, numMaskElts, workspaceBuf, workspaceBytes);
     } else {
       // In FP32 mode, maskBuf and maskFloatBuf share the same data
       maskFloatBuf = (float*)maskBuf;
@@ -3119,10 +3136,10 @@ void Model::applyPolicyHead(
   // Step 1: Apply p1Conv: trunk -> p1Out
   if(useFP16) {
     // p1Conv outputs FP16, p1OutBuf is float-sized, so we need FP16->FP32 conversion
-    // Use host-side conversion (aclnnCast is broken on some CANN/hardware combos)
+    // p1Conv outputs FP16, p1OutBuf is float-sized, so we need FP16->FP32 conversion
     p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), scratchBuf, workspaceBuf, workspaceBytes);
     size_t p1Elts = (size_t)batchSize * p1Channels * nnYLen * nnXLen;
-    castDeviceFP16ToFP32(stream, p1OutBuf, scratchBuf, p1Elts);
+    castDeviceFP16ToFP32(stream, p1OutBuf, scratchBuf, p1Elts, workspaceBuf, workspaceBytes);
   } else {
     p1Conv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, const_cast<void*>(trunkOutputBuf), p1OutBuf, workspaceBuf, workspaceBytes);
   }
@@ -3167,7 +3184,7 @@ void Model::applyPolicyHead(
     // Cast mean to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
     aclTensor* meanFP32Tensor;
     if(useFP16) {
-      castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts);
+      castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts, workspaceBuf, workspaceBytes);
       meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     } else {
       meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -3191,7 +3208,7 @@ void Model::applyPolicyHead(
     // Cast max to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
     aclTensor* maxFP32Tensor;
     if(useFP16) {
-      castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts);
+      castDeviceFP16ToFP32(stream, maxFP32Buf, maxPoolBuf, poolElts, workspaceBuf, workspaceBytes);
       maxFP32Tensor = handle->tensorCache.get(maxFP32Buf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     } else {
       maxFP32Tensor = handle->tensorCache.get(maxPoolBuf, {batchSize, g1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -3351,7 +3368,7 @@ void Model::applyValueHead(
     // 3b: Cast mean to FP32 if needed (use host-side conversion, aclnnCast is unreliable)
     aclTensor* meanFP32Tensor;
     if(useFP16) {
-      castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts);
+      castDeviceFP16ToFP32(stream, meanFP32Buf, meanPoolBuf, poolElts, workspaceBuf, workspaceBytes);
       meanFP32Tensor = handle->tensorCache.get(meanFP32Buf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     } else {
       meanFP32Tensor = handle->tensorCache.get(meanPoolBuf, {batchSize, v1Channels, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
@@ -3431,7 +3448,7 @@ void Model::applyValueHead(
   // vOwnershipConv uses FP16, ownershipBuf is FP32
   if(useFP16) {
     vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipScratchBuf, workspaceBuf, workspaceBytes);
-    castDeviceFP16ToFP32(stream, ownershipBuf, ownershipScratchBuf, (size_t)batchSize * ownershipChannels * nnYLen * nnXLen);
+    castDeviceFP16ToFP32(stream, ownershipBuf, ownershipScratchBuf, (size_t)batchSize * ownershipChannels * nnYLen * nnXLen, workspaceBuf, workspaceBytes);
   } else {
     vOwnershipConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, v1Out2Buf, ownershipBuf, workspaceBuf, workspaceBytes);
   }
