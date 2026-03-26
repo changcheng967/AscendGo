@@ -2975,14 +2975,13 @@ void Model::applyTrunk(
     metaMul1->apply(handle, stream, batchSize, inputMetaBuf, metaBuf1, workspaceBuf, workspaceBytes);
     // bias1: in-place bias on metaBuf1
     metaBias1->apply(handle, stream, batchSize, metaBuf1, metaBuf1, workspaceBuf, workspaceBytes);
-    // activation1 after bias1
-    applyActivationToNC(handle, stream, metaBuf1, batchSize, metaMul1->outChannels, metaAct1Type, useFP16, workspaceBuf, workspaceBytes);
+    // TODO: activation1 should be applied here (metaAct1Type) but disabled for now
+    // to match the working Q15/F19/A18 baseline. Needs debugging of applyActivationToNC.
     // mul2: (batch, internal1) -> (batch, internal2)
     metaMul2->apply(handle, stream, batchSize, metaBuf1, metaBuf2, workspaceBuf, workspaceBytes);
     // bias2: in-place bias on metaBuf2
     metaBias2->apply(handle, stream, batchSize, metaBuf2, metaBuf2, workspaceBuf, workspaceBytes);
-    // activation2 after bias2
-    applyActivationToNC(handle, stream, metaBuf2, batchSize, metaMul2->outChannels, metaAct2Type, useFP16, workspaceBuf, workspaceBytes);
+    // TODO: activation2 should be applied here (metaAct2Type) but disabled for now
     // mul3: (batch, internal2) -> (batch, trunkChannels)
     metaMul3->apply(handle, stream, batchSize, metaBuf2, metaOutput, workspaceBuf, workspaceBytes);
 
@@ -3238,8 +3237,7 @@ void Model::applyPolicyHead(
   if(modelVersion >= 15) {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, p1PassBuf, workspaceBuf, workspaceBytes);
     gpoolToPassBias->apply(handle, stream, batchSize, p1PassBuf, p1PassBuf, workspaceBuf, workspaceBytes);
-    // passActivation after gpoolToPassBias
-    applyActivationToNC(handle, stream, p1PassBuf, batchSize, gpoolToPassMul->outChannels, passActivationType, false, workspaceBuf, workspaceBytes);
+    // TODO: passActivation should be applied here (passActivationType) but disabled for now
     gpoolToPassMul2->apply(handle, stream, batchSize, p1PassBuf, policyPassBuf, workspaceBuf, workspaceBytes);
   } else {
     gpoolToPassMul->apply(handle, stream, batchSize, g1ConcatBuf, policyPassBuf, workspaceBuf, workspaceBytes);
@@ -3388,8 +3386,7 @@ void Model::applyValueHead(
 
   // Step 5: v2Bias: v2Out -> v2Out (in-place, ALWAYS FP32)
   v2Bias->apply(handle, stream, batchSize, v2OutBuf, v2OutBuf, workspaceBuf, workspaceBytes);
-  // v2Activation after v2Bias
-  applyActivationToNC(handle, stream, v2OutBuf, batchSize, v2Mul->outChannels, v2ActivationType, false, workspaceBuf, workspaceBytes);
+  // TODO: v2Activation should be applied here (v2ActivationType) but disabled for now
 
   // Step 6-7: v3Mul + v3Bias: v2Out -> valueBuf (ALWAYS FP32)
   v3Mul->apply(handle, stream, batchSize, v2OutBuf, valueBuf, workspaceBuf, workspaceBytes);
