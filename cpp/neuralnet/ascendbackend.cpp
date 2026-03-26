@@ -489,7 +489,10 @@ struct ComputeHandle {
     if(stream != nullptr) {
       aclrtDestroyStream(stream);
     }
-    aclrtResetDevice(deviceIdx);
+    // NOTE: Do NOT call aclrtResetDevice here. Resources (memory, streams) are
+    // freed explicitly by freeComputeHandle before this destructor runs.
+    // aclrtResetDevice during cleanup can cause "corrupted size vs prev_size"
+    // heap errors in glibc due to double-free of AscendCL internal bookkeeping.
   }
 
   void initScalars() {
