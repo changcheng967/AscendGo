@@ -241,39 +241,31 @@ static void* ascendMallocAndCopyFP16(const vector<float>& hostData) {
   return ascendMallocAndCopyFP16(hostData.data(), hostData.size());
 }
 
-// Device-side FP16 -> FP32 conversion using aclnnCast (pure D2D, no host round-trip)
-// Uses ACL_FORMAT_ND as required by aclnnCast. No stream sync needed - stays async.
+// FP16 -> FP32 conversion: uses host-side D2H+convert+H2D round trip.
+// aclnnCast was tried but produces async kernel failures (error 507015) on Ascend 910.
+// The host round trip is reliable and the cost is manageable since these are
+// relatively small tensors (pooled features, not full spatial maps).
 static void castDeviceFP16ToFP32(
   aclrtStream stream,
   void* dstFP32, const void* srcFP16, size_t numElements,
   void* workspaceBuf, size_t workspaceBytes
 ) {
+  (void)workspaceBuf;
+  (void)workspaceBytes;
   if(numElements == 0) return;
-  // Flatten to 1D ND tensors - contiguous memory, format doesn't affect layout
-  aclTensor* srcTensor = createAclTensor(const_cast<void*>(srcFP16), {(int64_t)numElements}, ACL_FLOAT16, ACL_FORMAT_ND);
-  aclTensor* dstTensor = createAclTensor(dstFP32, {(int64_t)numElements}, ACL_FLOAT, ACL_FORMAT_ND);
 
-  uint64_t wsSize = 0;
-  aclOpExecutor* executor = nullptr;
-  aclnnStatus status = aclnnCastGetWorkspaceSize(srcTensor, ACL_FLOAT, dstTensor, &wsSize, &executor);
-  if(status != ACLNN_SUCCESS) {
-    destroyAclTensor(srcTensor);
-    destroyAclTensor(dstTensor);
-    throw StringError("aclnnCastGetWorkspaceSize failed: " + to_string(status));
-  }
-  if(wsSize > workspaceBytes) {
-    destroyAclTensor(srcTensor);
-    destroyAclTensor(dstTensor);
-    throw StringError("aclnnCast workspace insufficient: need " + to_string(wsSize) + " have " + to_string(workspaceBytes));
-  }
-  status = aclnnCast(workspaceBuf, wsSize, executor, stream);
-  if(status != ACLNN_SUCCESS) {
-    destroyAclTensor(srcTensor);
-    destroyAclTensor(dstTensor);
-    throw StringError("aclnnCast failed: " + to_string(status));
-  }
-  destroyAclTensor(srcTensor);
-  destroyAclTensor(dstTensor);
+  size_t fp16Bytes = numElements * sizeof(aclFloat16);
+  size_t fp32Bytes = numElements * sizeof(float);
+  vector<aclFloat16> hostFP16(numElements);
+  vector<float> hostFP32(numElements);
+
+  // Sync to ensure the async op that produced srcFP16 is complete.
+  // aclrtMemcpy (sync) does NOT wait for prior async ops on the stream.
+  aclrtSynchronizeStream(stream);
+  aclrtMemcpy(hostFP16.data(), fp16Bytes, srcFP16, fp16Bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+  for(size_t i = 0; i < numElements; i++)
+    hostFP32[i] = aclFloat16ToFloat(hostFP16[i]);
+  aclrtMemcpy(dstFP32, fp32Bytes, hostFP32.data(), fp32Bytes, ACL_MEMCPY_HOST_TO_DEVICE);
 }
 
 
