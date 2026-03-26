@@ -998,6 +998,7 @@ struct ConvLayer {
   const int dilationX;
 
   void* filterBuf;              // Device memory for weights (NCHW: outC, inC, H, W)
+  void* filterBufTransposed;    // Device memory for transposed weights [inC, outC] (for 1x1 matmul path)
   aclDataType dtype;
   bool useFP16;
   int8_t cubeMathType;          // 0=KEEP_DTYPE (native FP16), 1=ALLOW_FP32_DOWN_PRECISION
@@ -1024,7 +1025,8 @@ struct ConvLayer {
       stridesArr(nullptr),
       paddingsArr(nullptr),
       dilationsArr(nullptr),
-      outputPaddingArr(nullptr)
+      outputPaddingArr(nullptr),
+      filterBufTransposed(nullptr)
   {
     // Allocate and copy weights to device with native FP16 conversion
     // KataGo weights are in (outC, inC, H, W) format which is NCHW-compatible
@@ -1037,6 +1039,27 @@ struct ConvLayer {
       filterBuf = ascendMallocAndCopy(desc->weights.data(), weightBytes);
       dtype = ACL_FLOAT;
       cubeMathType = 1;  // ALLOW_FP32_DOWN_PRECISION - let CANN convert FP32->FP16
+    }
+
+    // For 1x1 conv with small outChannels, pre-transpose weights for matmul path.
+    // DaVinci Cube Unit requires contiguous memory for matmul - strided views
+    // produce wrong results. We transpose [outC, inC] -> [inC, outC] on host,
+    // then upload the contiguous transposed weights to device.
+    if(shouldUseMatMulPath()) {
+      // Weights are stored as outC * inC elements in row-major [outC, inC] order
+      // Transpose to [inC, outC] on host, then upload
+      vector<float> transposed(desc->weights.size());
+      for(int oc = 0; oc < outChannels; oc++) {
+        for(int ic = 0; ic < inChannels; ic++) {
+          transposed[ic * outChannels + oc] = desc->weights[oc * inChannels + ic];
+        }
+      }
+      if(useFP16) {
+        filterBufTransposed = ascendMallocAndCopyFP16(transposed.data(), transposed.size());
+      } else {
+        size_t transposedBytes = transposed.size() * sizeof(float);
+        filterBufTransposed = ascendMallocAndCopy(transposed.data(), transposedBytes);
+      }
     }
 
     // Pre-create cached aclIntArray objects for convolution parameters
@@ -1052,6 +1075,7 @@ struct ConvLayer {
 
   ~ConvLayer() {
     ascendFree(filterBuf);
+    ascendFree(filterBufTransposed);
     // Destroy cached aclIntArray objects
     if(stridesArr) aclDestroyIntArray(stridesArr);
     if(paddingsArr) aclDestroyIntArray(paddingsArr);
@@ -1176,16 +1200,14 @@ struct ConvLayer {
       localTensors.push_back(input2DTensor);
     }
 
-    // Weight tensor: [C_out, C_in, 1, 1] viewed as [C_out, C_in] for matmul
-    // For matmul: input @ weight.T, so we need weight shape [C_in, C_out]
-    // But weights are stored as [C_out, C_in], so we create tensor with that shape
-    // and use aclnnMatmul which will compute input @ weight_transposed
-    vector<int64_t> weight2DShape = {C_out, C_in};  // Weights stored as [C_out, C_in]
+    // Weight tensor: filterBufTransposed is [C_in, C_out] contiguous (transposed in constructor)
+    // MatMul: input [NHW, C_in] @ weight [C_in, C_out] = output [NHW, C_out]
+    vector<int64_t> weight2DShape = {C_in, C_out};
     aclTensor* weight2DTensor;
     if(handle != nullptr) {
-      weight2DTensor = handle->tensorCache.get(filterBuf, weight2DShape, dtype, ACL_FORMAT_ND);
+      weight2DTensor = handle->tensorCache.get(filterBufTransposed, weight2DShape, dtype, ACL_FORMAT_ND);
     } else {
-      weight2DTensor = createAclTensor(filterBuf, weight2DShape, dtype, ACL_FORMAT_ND);
+      weight2DTensor = createAclTensor(filterBufTransposed, weight2DShape, dtype, ACL_FORMAT_ND);
       localTensors.push_back(weight2DTensor);
     }
 
@@ -1199,249 +1221,13 @@ struct ConvLayer {
       localTensors.push_back(output2DTensor);
     }
 
-    // Use aclnnMm (matrix multiply) which does: output = input @ weight
-    // But we need: output = input @ weight.T
-    // aclnnMm doesn't support transpose, so we use aclnnMatmul
-    // aclnnMatmul does: output = mat1 @ mat2 (also no transpose)
-    // Solution: Create a view of weight with transposed dimensions
-
-    // Actually, we need to transpose the weight. Let's use aclnnMatmul with
-    // the correct tensor view. The weight is [C_out, C_in], we need [C_in, C_out].
-    // We can achieve this by creating the weight tensor with transposed storage.
-
-    // Alternative: Use aclnnLinear which does output = input @ weight.T + bias
-    // This is exactly what we need! aclnnLinear(input, weight, bias) = input @ weight.T + bias
-
-    // For now, let's manually do the transpose using reshape trick
-    // Actually, let's use aclnnMatmulTransposed if available, or aclnnMm
-
-    // Simplest approach: Use aclnnLinear which computes input @ weight.T + bias
-    // aclnnLinearGetWorkspaceSize(input, weight, bias, output, ...)
-    // This is perfect for our case!
-
-    // Wait, aclnnLinear might not be available. Let's check what we have.
-    // For now, let's use a different approach: manual transpose then matmul
-
-    // Actually, the simplest fix is to use the existing weight tensor [C_out, C_in]
-    // and compute input @ weight.T by reshaping the computation.
-
-    // Since aclnnMatmul does: C = A @ B
-    // If A = [NHW, C_in] and B = [C_in, C_out], then C = [NHW, C_out]
-    // But our weight is stored as [C_out, C_in], not [C_in, C_out]
-
-    // Solution: Swap dimensions when creating the weight tensor view
-    // We create weight tensor with shape [C_in, C_out] by using different strides
-    // This is essentially a transpose view.
-
-    // Actually, let's just do: output = (input @ weight.T) = (weight @ input.T).T
-    // That's more complex. Let's try a simpler approach.
-
-    // NEW APPROACH: Use aclnnMm which does output = input @ weight
-    // But create the weight tensor with shape [C_in, C_out] by interpreting
-    // the data differently. Since weights are stored row-major as [C_out, C_in],
-    // we can't just reinterpret. We need to actually transpose.
-
-    // SIMPLEST FIX: Use aclnnMatMul with transposedB parameter
-    // Check if aclnn supports this...
-
-    // For now, let's use a workspace to transpose the weight first,
-    // then do matmul.
-
-    // Actually, looking at the CANN API, aclnnMatmul does support transposition!
-    // Let me check the signature...
-
-    // aclnnMatmulGetWorkspaceSize(mat1, mat2, output, cubeMathType, workspaceSize, executor)
-    // This does: output = mat1 @ mat2 (no transpose option visible)
-
-    // Let's try aclnnMm: output = input @ mat2
-    // Same issue - no transpose.
-
-    // OK, let's just do a manual approach:
-    // 1. Transpose weight from [C_out, C_in] to [C_in, C_out] using aclnnCopy or similar
-    // 2. Then do matmul
-
-    // For simplicity, let's just store the weights in transposed form
-    // for 1x1 convs with small output channels.
-
-    // Actually, the EASIEST fix is to change how we store weights for these layers.
-    // But that requires changes to the constructor.
-
-    // For a quick fix, let's transpose at runtime using aclnnCopy with permute
-    // But aclnnCopy doesn't support permute...
-
-    // Let's check if aclnnTranspose is available...
-    // It might be in aclnnop/aclnn_transpose.h or similar.
-
-    // For now, let's try a different approach: use aclnnMm and accept that
-    // the result will be wrong until we fix the transpose issue.
-    // NO - that would give wrong results.
-
-    // REAL FIX: We need to transpose the weight. Let me add a transposed weight buffer
-    // for 1x1 convs with small output channels.
-
-    // For immediate testing, let's use aclnnMatmul and see if we can pass
-    // cubeMathType to handle the transpose internally...
-
-    // Looking at aclnnMatmul more carefully:
-    // aclnnMatmulGetWorkspaceSize(const aclTensor *mat1, const aclTensor *mat2,
-    //                              aclTensor *out, int8_t cubeMathType,
-    //                              uint64_t *workspaceSize, aclOpExecutor **executor)
-    // mat1 @ mat2, no transpose support.
-
-    // Let me try using the weight as [C_in, C_out] by swapping the shape dimensions
-    // in the tensor descriptor. This is a "view" transpose which might not work
-    // because the data is still stored in [C_out, C_in] order.
-
-    // Actually wait - for a 1x1 conv, the weight is [C_out, C_in, 1, 1].
-    // If we just view it as [C_out, C_in] (2D), that's correct.
-    // For matmul we need: input [NHW, C_in] @ weight.T [C_in, C_out] = output [NHW, C_out]
-
-    // The weight is stored as [C_out, C_in] in memory.
-    // For matmul to work, we need the weight to be [C_in, C_out].
-
-    // TEMPORARY FIX: Use aclnnMm with the wrong orientation and accept the bug
-    // to see if the API works. We'll fix the transpose later.
-
-    // NO - let's do it right.
-
-    // The weight buffer contains data in [C_out, C_in] order.
-    // We need to access it as if it were [C_in, C_out].
-    // This requires actual data transposition, not just a view change.
-
-    // Since we can't easily transpose at runtime, let's modify the constructor
-    // to store weights in transposed form for small outChannels.
-
-    // For NOW, let's try a different approach: use aclnnLinear
-    // aclnnLinear does: output = input @ weight.T + bias
-    // This is EXACTLY what we need!
-
-    // But I don't have aclnnLinear header included. Let me check if it's available.
-    // It might be in aclnn_linear.h or aclnnop/aclnn_linear.h
-
-    // Since I can't easily add new headers right now, let's use a workaround:
-    // Store the input/output as 2D and use the Conv2d API with groups=inChannels
-    // which effectively does a 1x1 conv... no, that's wrong too.
-
-    // OK, FINAL APPROACH for now:
-    // Just use the convolution API but pad output channels to 16
-    // Actually, that requires output buffer changes...
-
-    // SIMPLEST: Let me just try aclnnMatmul with the weight as-is and see what error we get.
-    // Maybe it will work with different cubeMathType?
-
-    (void)workspaceBytes; (void)workspaceBuf; (void)accumulate;
-
-    // Use aclnnMatmul: output = mat1 @ mat2
-    // mat1 = input [NHW, C_in]
-    // mat2 = weight [C_out, C_in] - WRONG, should be [C_in, C_out]
-    // But let's try anyway to see if the API works
-
-    // Actually, let's swap the order: weight.T @ input.T = (input @ weight).T
-    // weight @ input.T = [C_out, C_in] @ [C_in, NHW] = [C_out, NHW]
-    // Then transpose to get [NHW, C_out]
-    // But we'd need to transpose input first...
-
-    // This is getting complicated. Let me just add runtime transpose.
-
-    // Create a transposed weight buffer in workspace
-    // weight is [C_out, C_in], we need [C_in, C_out]
-    // This is a transpose operation
-
-    // For the ownership conv: weight is [1, 128], we need [128, 1]
-    // Actually for 1 output channel, the transpose is trivial!
-
-    // When C_out = 1:
-    // weight [1, C_in] = row vector
-    // weight.T [C_in, 1] = column vector
-    // input @ weight.T = [NHW, C_in] @ [C_in, 1] = [NHW, 1] ✓
-
-    // But our weight tensor is [1, C_in], not [C_in, 1].
-    // We need to transpose. For C_out=1, we can use a special case.
-
-    // For C_out=1: weight is [1, C_in]
-    // input @ weight.T = input @ [C_in, 1] = [NHW, 1]
-    // But matmul does: input @ weight = [NHW, C_in] @ [1, C_in] - INVALID (inner dims don't match)
-
-    // So we MUST transpose the weight.
-
-    // Workaround: Use aclnnMm with weight reinterpreted as [C_in, 1]
-    // with strides adjusted to read the same data but in transposed order.
-    // For a [1, C_in] tensor stored row-major, stride is [C_in, 1].
-    // For a [C_in, 1] view of the same data, we need stride [1, 1] but that's wrong.
-
-    // Actually, let me think about this differently.
-    // Weight data: w[0][0], w[0][1], ..., w[0][C_in-1]  (one row)
-    // We want to view as [C_in, 1] column:
-    //   result[0][0] = w[0][0]
-    //   result[1][0] = w[0][1]
-    //   ...
-    //   result[C_in-1][0] = w[0][C_in-1]
-
-    // This IS a valid reinterpretation if we use the right strides!
-    // Original stride for [1, C_in]: [C_in, 1]
-    // New stride for [C_in, 1] view: [1, 1]  <- each row is 1 element, each col is 1 element stride
-
-    // Wait no. For row-major [1, C_in]:
-    //   element [i][j] is at offset i*C_in + j
-    //   stride[0] = C_in, stride[1] = 1
-
-    // For [C_in, 1] column view of same data:
-    //   element [i][0] should be at offset i (reading sequentially)
-    //   stride[0] = 1, stride[1] = 1
-
-    // Yes! For a single-row tensor [1, C_in], viewing it as [C_in, 1] column
-    // with stride [1, 1] would read elements sequentially, which is correct!
-
-    // But wait, for [C_in, 1] with stride [1, 1], the storage size is still
-    // computed based on shape. C_in * 1 * element_size. But we only have C_in elements,
-    // so that's correct.
-
-    // Let me create the weight tensor with transposed shape and adjusted strides.
-
-    // For the general case where C_out might not be 1, we need a different approach.
-    // Let me check if C_out is always 1 for the failing case...
-
-    // From the error: outChannels=1. So for the immediate fix, let's handle C_out=1.
-
-    // For C_out=1: Create weight tensor as [C_in, 1] with stride [1, 1]
-    // This is a column vector view of the row vector data.
-
-    // Actually, I realize aclCreateTensor allows specifying strides!
-    // Let me use that to create a transposed view.
-
-    // For weight data [C_out, C_in] stored row-major:
-    // Shape: [C_out, C_in], Strides: [C_in, 1]
-
-    // To view as [C_in, C_out] (transposed):
-    // Shape: [C_in, C_out], Strides: [1, C_in]  <- swap the strides!
-
-    // Let's try this approach.
-
-    // Create transposed weight view
-    vector<int64_t> weightTransShape = {C_in, C_out};
-    vector<int64_t> weightTransStrides = {1, C_in};  // Swapped from [C_out, C_in]'s [C_in, 1]
-    vector<int64_t> weightStorageShape = {C_out, C_in};  // Original physical layout
-
-    aclTensor* weightTransTensor = aclCreateTensor(
-      weightTransShape.data(),                      // viewDims
-      static_cast<uint64_t>(weightTransShape.size()), // viewDimsNum
-      dtype,                                        // dataType
-      weightTransStrides.data(),                    // stride
-      static_cast<int64_t>(0),                      // offset
-      ACL_FORMAT_ND,                                // format
-      weightStorageShape.data(),                    // storageDims (original physical layout)
-      static_cast<uint64_t>(weightStorageShape.size()), // storageDimsNum
-      filterBuf                                     // data
-    );
-    localTensors.push_back(weightTransTensor);
-
-    // Now do matmul: input [NHW, C_in] @ weightTrans [C_in, C_out] = output [NHW, C_out]
+    // MatMul: input [NHW, C_in] @ weight [C_in, C_out] = output [NHW, C_out]
     uint64_t matmulWsSize = 0;
     aclOpExecutor* matmulExecutor = nullptr;
 
     aclnnStatus status = aclnnMatmulGetWorkspaceSize(
       input2DTensor,
-      weightTransTensor,
+      weight2DTensor,
       output2DTensor,
       cubeMathType,
       &matmulWsSize,
