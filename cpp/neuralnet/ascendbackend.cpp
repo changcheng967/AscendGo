@@ -278,7 +278,11 @@ struct LoadedModel {
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
     ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
-    modelDesc.applyScale8ToReduceActivations();
+    // modelDesc.applyScale8ToReduceActivations();
+    // TODO: Temporarily disabled - the applyScale8 transformation causes bad moves.
+    // Hypothesis: aclnnInplaceMuls with ACL_FLOAT scalar on FP16 tensors
+    // may not handle type promotion correctly in CANN 9.0.
+    // Need to verify MISH_SCALE8 with dtype-appropriate scalars first.
   }
 
   LoadedModel() = delete;
