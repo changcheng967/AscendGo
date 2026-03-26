@@ -33,6 +33,7 @@
 #include "../neuralnet/activations.h"
 
 #include "../core/test.h"
+#include "../core/simpleallocator.h"
 
 using namespace std;
 
@@ -629,12 +630,12 @@ struct ScratchBuffers {
   const int nnYLen;
   const bool useFP16;
 
+  // Pool allocator for dynamic scratch buffer allocation (like CUDA backend)
+  SimpleAllocator<void*>* allocator;
+
   // Pre-allocated workspace for ACLNN operations
   void* workspaceBuf;
   size_t workspaceBytes;
-
-  // Track allocated buffers for cleanup
-  vector<void*> allocatedBuffers;
 
   ScratchBuffers() = delete;
   ScratchBuffers(const ScratchBuffers&) = delete;
@@ -652,6 +653,15 @@ struct ScratchBuffers {
       workspaceBuf(nullptr),
       workspaceBytes(0)
   {
+    // Create pool allocator for scratch buffers (aclrtMalloc/aclrtFree)
+    std::function<void*(size_t)> allocateFunc = [](size_t size) -> void* {
+      return ascendMalloc(size);
+    };
+    std::function<void(void*)> releaseFunc = [](void* buf) {
+      ascendFree(buf);
+    };
+    allocator = new SimpleAllocator<void*>(allocateFunc, releaseFunc);
+
     // Pre-allocate workspace
     workspaceBytes = maxWorkspaceNeeded;
     if(workspaceBytes > 0) {
@@ -660,31 +670,9 @@ struct ScratchBuffers {
   }
 
   ~ScratchBuffers() {
-    // Free any allocated buffers
-    for(void* buf : allocatedBuffers) {
-      ascendFree(buf);
-    }
+    delete allocator;
     if(workspaceBuf != nullptr) {
       ascendFree(workspaceBuf);
-    }
-  }
-
-  // Allocate a buffer of the given size and track it for cleanup
-  void* allocate(size_t size) {
-    void* buf = ascendMalloc(size);
-    allocatedBuffers.push_back(buf);
-    return buf;
-  }
-
-  // Release tracking for a buffer (does not free immediately, just removes from tracking)
-  void release(void* buf) {
-    // Find and remove from tracking (buffer will be freed in destructor)
-    for(auto it = allocatedBuffers.begin(); it != allocatedBuffers.end(); ++it) {
-      if(*it == buf) {
-        allocatedBuffers.erase(it);
-        ascendFree(buf);
-        return;
-      }
     }
   }
 
@@ -1995,68 +1983,53 @@ struct ResidualBlock {
 
   void apply(
     ComputeHandle* handle,
-    aclrtStream stream,
+    ScratchBuffers* scratch,
     int batchSize,
-    int nnXLen,
-    int nnYLen,
     const void* maskBuf,
     void* trunkBuf,
     void* trunkScratchBuf,
-    void* midBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
-    // Match CUDA's ResidualBlock pattern exactly:
-    // Uses 3 separate buffers to avoid in-place convolution.
-    //
-    // CUDA flow (ResidualBlock):
-    //   midIn = Conv(BN(trunkBuf))        [normActConv1]
-    //   trunkBuf = Conv(BN(midIn)) + trunkBuf  [normActConv2 with accumulate]
-    //
-    // We avoid in-place operations by using trunkBuf, trunkScratchBuf, midBuf:
-    //   1. preBN: trunkBuf → trunkScratchBuf (trunkBuf PRESERVED)
-    //   2. preConv: trunkScratchBuf → midBuf
-    //   3. midBN: midBuf → trunkScratchBuf (midBuf PRESERVED)
-    //   4. midConv: trunkScratchBuf → midBuf
-    //   5. Residual add: midBuf + trunkBuf → trunkBuf
+    // Match CUDA's ResidualBlock pattern: allocate mid from scratch pool
+    SizedBuf<void*> midIn(scratch->allocator, scratch->getBufSizeXY(preNormActConv->convLayer->outChannels));
+    SizedBuf<void*> midScratch(scratch->allocator, scratch->getBufSizeXY(preNormActConv->convLayer->outChannels));
 
-    // Step 1: preBN + preActivation: trunkBuf → trunkScratchBuf
-    preNormActConv->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
-
-    // Step 2: preConv: trunkScratchBuf → midBuf
-    preNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
-
-    // Step 3: midBN + midActivation: midBuf → trunkScratchBuf
-    midNormActConv->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
-
-    // Step 4: midConv: trunkScratchBuf → midBuf
-    midNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
-
-    fprintf(stderr, "ASCEND:     residualBlock convs done, residual add\n");
-
-    // Step 5: Residual add: midBuf + trunkBuf → trunkBuf
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
+    int channels = numChannels;
+    int xLen = preNormActConv->convLayer->nnXLen;
+    int yLen = preNormActConv->convLayer->nnYLen;
 
-    vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
-    aclTensor* midTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
+    // Step 1: BN+Act: trunkBuf -> midScratch (preserve trunkBuf for residual)
+    preNormActConv->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, midScratch.buf, workspaceBuf, workspaceBytes);
+
+    // Step 2: Conv: midScratch -> midIn
+    preNormActConv->convLayer->apply(handle, stream, batchSize, xLen, yLen, false, midScratch.buf, midIn.buf, workspaceBuf, workspaceBytes);
+
+    // Step 3: BN+Act: midIn -> trunkScratchBuf
+    midNormActConv->bnLayer->apply(handle, stream, batchSize, midIn.buf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
+
+    // Step 4: Conv: trunkScratchBuf -> midIn
+    midNormActConv->convLayer->apply(handle, stream, batchSize, xLen, yLen, false, trunkScratchBuf, midIn.buf, workspaceBuf, workspaceBytes);
+
+    // Step 5: Residual add: midIn + trunkBuf -> trunkBuf
+    vector<int64_t> addShape = {batchSize, channels, yLen, xLen};
+    aclTensor* midTensor = handle->tensorCache.get(midIn.buf, addShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
 
     uint64_t addWsSize = 0;
     aclOpExecutor* addExecutor = nullptr;
-
     aclnnStatus status = aclnnAddGetWorkspaceSize(midTensor, trunkTensor, handle->alphaOneScalar, resultTensor, &addWsSize, &addExecutor);
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAddGetWorkspaceSize failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
-
     status = aclnnAdd(workspaceBuf, addWsSize, addExecutor, stream);
-
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnAdd failed for ResidualBlock " + name + " with error: " + to_string(status));
     }
 
-    (void)workspaceBytes;
+    // midIn and midScratch are freed by SizedBuf destructor (returned to pool)
   }
 };
 
@@ -2115,18 +2088,73 @@ struct GlobalPoolingResidualBlock {
 
   void apply(
     ComputeHandle* handle,
+    ScratchBuffers* scratch,
     aclrtStream stream,
     int batchSize,
     const void* maskBuf,
     const float* maskSumBuf,
     void* trunkBuf,
     void* trunkScratchBuf,
-    void* midBuf,
-    void* gpoolConvOutBuf,
-    void* gpoolScratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
+    // Allocate scratch buffers (like CUDA backend)
+    SizedBuf<void*> regularOut(scratch->allocator, scratch->getBufSizeXY(regularChannels));
+    SizedBuf<void*> regularScratch(scratch->allocator, scratch->getBufSizeXY(regularChannels));
+    SizedBuf<void*> gpoolOut(scratch->allocator, scratch->getBufSizeXY(gpoolChannels));
+    SizedBuf<void*> gpoolOut2(scratch->allocator, scratch->getBufSizeXY(gpoolChannels));
+    SizedBuf<void*> gpoolScratch(scratch->allocator, scratch->getBufSize(gpoolChannels * 3));
+
+    // gpoolScratch layout: [mean | meanFP32 | max | maxFP32 | scaledMean | concat(3x) | bias]
+    // Total needed: poolBytesDtype + poolBytesFP32 + poolBytesDtype + poolBytesFP32 + poolBytesFP32 + 3*poolBytesFP32 + regularChannels*batch*4
+    // gpoolScratch size = gpoolChannels * 3 * batchBytes (this might not be enough for the full layout)
+    // We need additional scratch for the pooling intermediates. Let's allocate a large enough buffer.
+    // Actually, let's compute the exact size needed and allocate it separately.
+    // The gpoolScratch sizedBuf above may be too small. Let me add a separate allocation.
+
+    // Actually, let me be more careful about sizing. The CUDA backend uses:
+    // - regularOut = channels * batchXYBytes
+    // - regularScratch = channels * batchXYBytes
+    // - gpoolOut = gpoolChannels * batchXYBytes
+    // - gpoolOut2 = gpoolChannels * batchXYBytes
+    // - gpoolConcat = gpoolChannels * 3 * batchBytes
+    // - gpoolBias = regularChannels * batchBytes
+    // Then the pooling is done via custom CUDA kernels that write directly into gpoolConcat.
+    //
+    // We need additional space for the pooling intermediates (mean, meanFP32, max, maxFP32, scaledMean).
+    // These are small (batch * gpoolChannels each). Let's allocate a separate buffer for pooling scratch.
+
+    size_t poolElts = (size_t)batchSize * gpoolChannels;
+    size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : (poolElts * sizeof(float));
+    size_t poolBytesFP32 = poolElts * sizeof(float);
+    // Pool scratch: mean(poolBytesDtype) + meanFP32(poolBytesFP32) + max(poolBytesDtype) + maxFP32(poolBytesFP32) + scaledMean(poolBytesFP32)
+    size_t poolScratchBytes = 2 * poolBytesDtype + 3 * poolBytesFP32;
+    // gpoolBias scratch: regularChannels * batchSize * sizeof(float)
+    size_t gpoolBiasBytes = (size_t)regularChannels * batchSize * sizeof(float);
+    SizedBuf<void*> poolScratch(scratch->allocator, poolScratchBytes);
+    SizedBuf<void*> gpoolBias(scratch->allocator, gpoolBiasBytes);
+
+    void* meanPoolBuf = poolScratch.buf;
+    void* meanFP32Buf = (char*)meanPoolBuf + poolBytesDtype;
+    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;
+    void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;
+    void* scaledMeanBuf = (char*)maxFP32Buf + poolBytesFP32;
+
+    // gpoolConcat goes into gpoolScratch (allocated above as gpoolChannels * 3 * batchBytes)
+    // For FP16 mode, the concat is always FP32, so we need poolElts * 3 * sizeof(float)
+    // gpoolScratch is sized as gpoolChannels * 3 * batchBytes which for FP16 is gpoolChannels * 3 * batch * 2
+    // But we need gpoolChannels * 3 * batch * 4 (float). So this might be too small!
+    // Let me reallocate with the correct size.
+    // Actually, let me just use a separate SizedBuf for the concat:
+    SizedBuf<void*> gpoolConcat(scratch->allocator, poolElts * 3 * sizeof(float));
+
+    // Now the regularScratch and gpoolOut2 SizedBufs are allocated but not needed
+    // (we use poolScratch instead). They'll be returned to the pool on destruction.
+
+    // Use regularOut.buf as "midBuf" (same role as before)
+    void* midBuf = regularOut.buf;
+
+    aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
     // Match CUDA's GlobalPoolingResidualBlock pattern exactly:
     // 1. preBN: trunkBuf -> trunkScratchBuf (preserves trunkBuf for residual)
     // 2. TWO parallel convs from trunkScratchBuf:
@@ -2142,25 +2170,6 @@ struct GlobalPoolingResidualBlock {
     // workspaceBuf is ONLY used for ACLNN operator workspace (never for data storage).
 
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
-    size_t poolElts = (size_t)batchSize * gpoolChannels;
-    size_t poolBytesDtype = useFP16 ? (poolElts * sizeof(aclFloat16)) : (poolElts * sizeof(float));
-    size_t poolBytesFP32 = poolElts * sizeof(float);
-
-    // Layout in gpoolScratchBuf:
-    //   [0..poolBytesDtype)                          = meanPool result
-    //   [poolBytesDtype..+poolBytesFP32)              = meanFP32
-    //   [+poolBytesFP32..+poolBytesDtype)             = maxPool result
-    //   [+poolBytesDtype..+poolBytesFP32)             = maxFP32
-    //   [+poolBytesFP32..+poolBytesFP32)              = scaledMean
-    //   [+poolBytesFP32..+3*poolBytesFP32)            = gpoolConcat
-    //   [+3*poolBytesFP32..+regularChannels*batch*4]  = gpoolBias
-    void* meanPoolBuf = gpoolScratchBuf;
-    void* meanFP32Buf = (char*)meanPoolBuf + poolBytesDtype;
-    void* maxPoolBuf = (char*)meanFP32Buf + poolBytesFP32;
-    void* maxFP32Buf = (char*)maxPoolBuf + poolBytesDtype;
-    void* scaledMeanBuf = (char*)maxFP32Buf + poolBytesFP32;
-    void* gpoolConcatBuf = (char*)scaledMeanBuf + poolBytesFP32;
-    void* gpoolBiasBuf = (char*)gpoolConcatBuf + (size_t)gpoolChannels * 3 * batchSize * sizeof(float);
 
     // Step 1: preBN on trunk -> trunkScratchBuf (trunkBuf preserved for residual)
     preBN->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
@@ -2168,18 +2177,17 @@ struct GlobalPoolingResidualBlock {
     // Step 2a: regularConv: trunkScratchBuf -> midBuf (midBuf = regularOut)
     regularConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
 
-    // Step 2b: gpoolConv: trunkScratchBuf -> gpoolConvOutBuf
-    // Uses separate buffer to avoid in-place convolution (CANN may not support it)
-    gpoolConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, gpoolConvOutBuf, workspaceBuf, workspaceBytes);
+    // Step 2b: gpoolConv: trunkScratchBuf -> gpoolOut
+    gpoolConv->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, gpoolOut.buf, workspaceBuf, workspaceBytes);
 
-    // Step 3: gpoolBN: gpoolConvOutBuf -> gpoolConvOutBuf (in-place BN is safe)
-    gpoolBN->apply(handle, stream, batchSize, gpoolConvOutBuf, maskBuf, gpoolConvOutBuf, workspaceBuf, workspaceBytes);
+    // Step 3: gpoolBN: gpoolOut -> gpoolOut2
+    gpoolBN->apply(handle, stream, batchSize, gpoolOut.buf, maskBuf, gpoolOut2.buf, workspaceBuf, workspaceBytes);
 
     // Step 4: Global pooling on gpoolConvOutBuf -> intermediates in gpoolScratchBuf (ALWAYS FP32)
     // Computes [mean, scaledMean, max] -> [batch, gpoolChannels * 3]
     {
       // 4a: Mean pooling
-      aclTensor* gpoolOutTensorND = handle->tensorCache.get(gpoolConvOutBuf, {batchSize, gpoolChannels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
+      aclTensor* gpoolOutTensorND = handle->tensorCache.get(gpoolOut2.buf, {batchSize, gpoolChannels, nnYLen, nnXLen}, dtype, ACL_FORMAT_ND);
       aclTensor* meanPoolTensorND = handle->tensorCache.get(meanPoolBuf, {batchSize, gpoolChannels, 1, 1}, dtype, ACL_FORMAT_ND);
 
       aclIntArray* meanReduceDims = createAclIntArray({2, 3});
@@ -2246,24 +2254,24 @@ struct GlobalPoolingResidualBlock {
         }
       }
 
-      // 4f: Concatenate [mean, scaledMean, max] -> gpoolConcatBuf using D2D copies
+      // 4f: Concatenate [mean, scaledMean, max] -> gpoolConcat using D2D copies
       // (aclnnCat has compatibility issues with CANN 9.0; D2D memcpy is equivalent and more reliable)
       {
         size_t segmentBytes = poolElts * sizeof(float);
-        aclError copyErr = aclrtMemcpyAsync(gpoolConcatBuf, segmentBytes, meanFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        aclError copyErr = aclrtMemcpyAsync(gpoolConcat.buf, segmentBytes, meanFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
         if(copyErr != ACL_SUCCESS)
           throw StringError("aclrtMemcpyAsync failed for gpool block concat segment 0: " + to_string(copyErr));
-        copyErr = aclrtMemcpyAsync((char*)gpoolConcatBuf + segmentBytes, segmentBytes, scaledMeanBuf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        copyErr = aclrtMemcpyAsync((char*)gpoolConcat.buf + segmentBytes, segmentBytes, scaledMeanBuf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
         if(copyErr != ACL_SUCCESS)
           throw StringError("aclrtMemcpyAsync failed for gpool block concat segment 1: " + to_string(copyErr));
-        copyErr = aclrtMemcpyAsync((char*)gpoolConcatBuf + 2 * segmentBytes, segmentBytes, maxFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+        copyErr = aclrtMemcpyAsync((char*)gpoolConcat.buf + 2 * segmentBytes, segmentBytes, maxFP32Buf, segmentBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
         if(copyErr != ACL_SUCCESS)
           throw StringError("aclrtMemcpyAsync failed for gpool block concat segment 2: " + to_string(copyErr));
       }
     }
 
-    // Step 5: gpoolToBiasMul: gpoolConcat (FP32) -> gpoolBias (FP32, in gpoolScratchBuf)
-    gpoolToBiasMul->apply(handle, stream, batchSize, gpoolConcatBuf, gpoolBiasBuf, workspaceBuf, workspaceBytes);
+    // Step 5: gpoolToBiasMul: gpoolConcat (FP32) -> gpoolBias (FP32)
+    gpoolToBiasMul->apply(handle, stream, batchSize, gpoolConcat.buf, gpoolBias.buf, workspaceBuf, workspaceBytes);
 
     // Step 6: Add gpoolBias to regularOut (midBuf) - broadcast across spatial dims
     {
@@ -2271,7 +2279,7 @@ struct GlobalPoolingResidualBlock {
       vector<int64_t> biasShape = {batchSize, regularChannels, 1, 1};
 
       aclTensor* regularOutTensor = handle->tensorCache.get(midBuf, regularOutShape, dtype, ACL_FORMAT_NCHW);
-      aclTensor* biasTensor = handle->tensorCache.get(gpoolBiasBuf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
+      aclTensor* biasTensor = handle->tensorCache.get(gpoolBias.buf, biasShape, ACL_FLOAT, ACL_FORMAT_NCHW);
       aclTensor* resultTensor = handle->tensorCache.get(midBuf, regularOutShape, dtype, ACL_FORMAT_NCHW);
 
       uint64_t addWsSize = 0;
@@ -2349,15 +2357,13 @@ struct NestedBottleneckResidualBlock {
 
   void apply(
     ComputeHandle* handle,
+    ScratchBuffers* scratch,
     aclrtStream stream,
     int batchSize,
     const void* maskBuf,
     float* maskSumBuf,
     void* trunkBuf,
     void* trunkScratchBuf,
-    void* midBuf,
-    void* gpoolConvOutBuf,
-    void* gpoolScratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const;
@@ -2446,37 +2452,33 @@ struct BlockStack {
 
   void apply(
     ComputeHandle* handle,
+    ScratchBuffers* scratch,
     aclrtStream stream,
     int batchSize,
     const void* maskBuf,
     float* maskSumBuf,
     void* trunkBuf,
     void* trunkScratchBuf,
-    void* midBuf,
-    void* gpoolConvOutBuf,
-    void* gpoolScratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
     for(int i = 0; i < (int)blocks.size(); i++) {
       if(blocks[i].first == ORDINARY_BLOCK_KIND) {
         ResidualBlock* block = static_cast<ResidualBlock*>(blocks[i].second.get());
-        block->apply(handle, stream, batchSize, nnXLen, nnYLen, maskBuf,
-          trunkBuf, trunkScratchBuf, midBuf,
+        block->apply(handle, scratch, batchSize, maskBuf,
+          trunkBuf, trunkScratchBuf,
           workspaceBuf, workspaceBytes);
       }
       else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
         GlobalPoolingResidualBlock* block = static_cast<GlobalPoolingResidualBlock*>(blocks[i].second.get());
-        block->apply(handle, stream, batchSize, maskBuf, maskSumBuf,
-          trunkBuf, trunkScratchBuf, midBuf,
-          gpoolConvOutBuf, gpoolScratchBuf,
+        block->apply(handle, scratch, stream, batchSize, maskBuf, maskSumBuf,
+          trunkBuf, trunkScratchBuf,
           workspaceBuf, workspaceBytes);
       }
       else if(blocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
         NestedBottleneckResidualBlock* block = static_cast<NestedBottleneckResidualBlock*>(blocks[i].second.get());
-        block->apply(handle, stream, batchSize, maskBuf, maskSumBuf,
-          trunkBuf, trunkScratchBuf, midBuf,
-          gpoolConvOutBuf, gpoolScratchBuf,
+        block->apply(handle, scratch, stream, batchSize, maskBuf, maskSumBuf,
+          trunkBuf, trunkScratchBuf,
           workspaceBuf, workspaceBytes);
       }
     }
@@ -2524,40 +2526,38 @@ void NestedBottleneckResidualBlock::apply(
   float* maskSumBuf,
   void* trunkBuf,
   void* trunkScratchBuf,
-  void* midBuf,
-  void* gpoolConvOutBuf,
-  void* gpoolScratchBuf,
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
   // Match CUDA's NestedBottleneckResidualBlock::apply exactly:
-  // 1. normActConv1: trunkBuf -> midBuf (BN+Act+Conv)
-  // 2. innerBlocks: midBuf -> midBuf (recursive)
-  // 3. normActConv2: midBuf -> trunkBuf with accumulate=true (residual add)
+  // 1. normActConv1: trunkBuf -> mid (BN+Act+Conv) using dynamically allocated mid
+  // 2. innerBlocks: mid -> mid (recursive, with own midScratch)
+  // 3. normActConv2: mid -> trunkBuf with residual add
 
-  // Step 1: normActConv1: trunkBuf -> midBuf
-  // CUDA: normActConv1.apply(cudaHandles,batchSize,false,trunkBuf,trunkScratchBuf,mid.buf,maskBuf,...)
+  // Allocate mid and midScratch from scratch pool (like CUDA backend)
+  SizedBuf<void*> mid(scratch->allocator, scratch->getBufSizeXY(normActConv1->convLayer->outChannels));
+  SizedBuf<void*> midScratch(scratch->allocator, scratch->getBufSizeXY(normActConv1->convLayer->outChannels));
+
+  // Step 1: normActConv1: BN(trunkBuf) -> trunkScratchBuf, Conv(trunkScratchBuf) -> mid
   normActConv1->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
-  normActConv1->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+  normActConv1->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, mid.buf, workspaceBuf, workspaceBytes);
 
-  // Step 2: innerBlocks operates on midBuf (as trunk) with trunkScratchBuf as scratch
-  // CUDA: blocks.apply(cudaHandles,scratch,batchSize,maskBuf,maskSumBuf,mid.buf,midScratch.buf,...)
+  // Step 2: innerBlocks operates on mid (as trunk) with midScratch as scratch
   innerBlocks->apply(
-    handle, stream, batchSize, maskBuf, maskSumBuf,
-    midBuf, trunkScratchBuf, midBuf,
-    gpoolConvOutBuf, gpoolScratchBuf,
+    handle, scratch, batchSize, maskBuf, maskSumBuf,
+    mid.buf, midScratch.buf,
     workspaceBuf, workspaceBytes
   );
 
-  // Step 3: normActConv2 with residual add (accumulate=true)
-  // CUDA: normActConv2.apply(cudaHandles,batchSize,true,mid.buf,midScratch.buf,trunkBuf,maskBuf,...)
-  normActConv2->bnLayer->apply(handle, stream, batchSize, midBuf, maskBuf, trunkScratchBuf, workspaceBuf, workspaceBytes);
-  normActConv2->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midBuf, workspaceBuf, workspaceBytes);
+  // Step 3: normActConv2 with residual add
+  // BN(mid) -> midScratch, Conv(midScratch) -> mid, then mid + trunkBuf -> trunkBuf
+  normActConv2->bnLayer->apply(handle, stream, batchSize, mid.buf, maskBuf, midScratch.buf, workspaceBuf, workspaceBytes);
+  normActConv2->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, midScratch.buf, mid.buf, workspaceBuf, workspaceBytes);
 
-  // Residual add: midBuf + trunkBuf -> trunkBuf
+  // Residual add: mid + trunkBuf -> trunkBuf
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   vector<int64_t> addShape = {batchSize, numChannels, nnYLen, nnXLen};
-  aclTensor* midTensor = handle->tensorCache.get(midBuf, addShape, dtype, ACL_FORMAT_NCHW);
+  aclTensor* midTensor = handle->tensorCache.get(mid.buf, addShape, dtype, ACL_FORMAT_NCHW);
   aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
   aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
 
@@ -2571,6 +2571,8 @@ void NestedBottleneckResidualBlock::apply(
   if(status != ACLNN_SUCCESS) {
     throw StringError("aclnnAdd failed for NestedBottleneckResidualBlock " + name + " with error: " + to_string(status));
   }
+
+  // mid and midScratch freed by SizedBuf destructor (returned to pool)
 }
 
 //---------------------------------------------------------------------------------
@@ -2670,9 +2672,6 @@ private:
     void* maskBuf,
     float* maskSumBuf,
     void* scratchBuf,
-    void* residualMidBuf,
-    void* gpoolConvOutBuf,
-    void* gpoolScratchBuf,
     void* workspaceBuf,
     size_t workspaceBytes
   ) const;
@@ -2957,7 +2956,7 @@ void Model::apply(
   // Step 2: Apply trunk
   // ================================================================
   fprintf(stderr, "ASCEND: Step 2 applyTrunk start\n");
-  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, maskSumBuf, scratchBuf, buffers->residualMidBuf, buffers->gpoolConvOutBuf, buffers->gpoolScratchBuf, workspaceBuf, workspaceBytes);
+  applyTrunk(handle, stream, batchSize, inputBuf, inputGlobalBuf, inputMetaBuf, trunkOutputBuf, maskBuf, maskSumBuf, scratchBuf, workspaceBuf, workspaceBytes);
   fprintf(stderr, "ASCEND: Step 2 applyTrunk done\n");
 
   // ================================================================
@@ -2986,9 +2985,6 @@ void Model::applyTrunk(
   void* maskBuf,
   float* maskSumBuf,
   void* scratchBuf,
-  void* residualMidBuf,
-  void* gpoolConvOutBuf,
-  void* gpoolScratchBuf,
   void* workspaceBuf,
   size_t workspaceBytes
 ) const {
@@ -3040,9 +3036,8 @@ void Model::applyTrunk(
   (void)metaBias2;
   (void)metaMul3;
 
-  // Step 3: Trunk blocks (Residual + GlobalPooling) - iterated in model order
-  // Match CUDA's BlockStack: iterate blocks in their original order,
-  // using per-type indices since blocks are stored in separate vectors.
+  // Step 3: Trunk blocks (Residual + GlobalPooling + NestedBottleneck)
+  // Use scratch allocator for mid buffers (like CUDA backend)
   {
     int regularIdx = 0;
     int gpoolIdx = 0;
@@ -3052,24 +3047,22 @@ void Model::applyTrunk(
       switch(trunkBlockKinds[i]) {
       case ORDINARY_BLOCK_KIND:
         residualBlocks[regularIdx]->apply(
-          handle, stream, batchSize, nnXLen, nnYLen, maskBuf,
-          scratchBuf, trunkOutputBuf, residualMidBuf,
+          handle, handle->scratch, batchSize, maskBuf,
+          scratchBuf, trunkOutputBuf,
           workspaceBuf, workspaceBytes);
         regularIdx++;
         break;
       case GLOBAL_POOLING_BLOCK_KIND:
         gpoolBlocks[gpoolIdx]->apply(
-          handle, stream, batchSize, maskBuf, maskSumBuf,
-          scratchBuf, trunkOutputBuf, residualMidBuf,
-          gpoolConvOutBuf, gpoolScratchBuf,
+          handle, handle->scratch, stream, batchSize, maskBuf, maskSumBuf,
+          scratchBuf, trunkOutputBuf,
           workspaceBuf, workspaceBytes);
         gpoolIdx++;
         break;
       case NESTED_BOTTLENECK_BLOCK_KIND:
         nestedBlocks[nestedIdx]->apply(
-          handle, stream, batchSize, maskBuf, maskSumBuf,
-          scratchBuf, trunkOutputBuf, residualMidBuf,
-          gpoolConvOutBuf, gpoolScratchBuf,
+          handle, handle->scratch, stream, batchSize, maskBuf, maskSumBuf,
+          scratchBuf, trunkOutputBuf,
           workspaceBuf, workspaceBytes);
         nestedIdx++;
         break;
@@ -3996,11 +3989,10 @@ bool NeuralNet::testEvaluateResidualBlock(
   aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
   size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
 
-  // Allocate device buffers (3 buffers for trunkBuf, trunkScratchBuf, midBuf pattern)
+  // Allocate device buffers
   void* deviceInput = ascendMalloc(numInputFloats * eltSize);
   void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
   void* deviceScratch = ascendMalloc(numInputFloats * eltSize);
-  void* deviceMid = ascendMalloc(numInputFloats * eltSize);
 
   // Copy inputs to device
   ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
@@ -4031,9 +4023,10 @@ bool NeuralNet::testEvaluateResidualBlock(
   // Also need model/buffers set (nullptr OK since we're not using them)
   tempHandle->model = nullptr;
   tempHandle->buffers = nullptr;
+  tempHandle->scratch = &scratch;
 
-  residualBlock->apply(tempHandle, stream, batchSize, nnXLen, nnYLen, deviceMask,
-                     deviceInput, deviceScratch, deviceMid, deviceWorkspace, workspaceBytes);
+  residualBlock->apply(tempHandle, &scratch, batchSize, deviceMask,
+                     deviceInput, deviceScratch, deviceWorkspace, workspaceBytes);
 
   // Synchronize
   ACL_CHECK(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
@@ -4047,7 +4040,6 @@ bool NeuralNet::testEvaluateResidualBlock(
   ascendFree(deviceInput);
   ascendFree(deviceMask);
   ascendFree(deviceScratch);
-  ascendFree(deviceMid);
   delete residualBlock;
   // Clean up temp handle (stream is owned by us, don't destroy it)
   tempHandle->stream = nullptr;
@@ -4094,18 +4086,7 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   void* deviceInput = ascendMalloc(numInputFloats * eltSize);
   void* deviceMask = ascendMalloc(numMaskFloats * eltSize);
   float* deviceMaskSum = (float*)ascendMalloc(numMaskSumFloats * sizeof(float));
-  void* deviceGpoolConvOut = ascendMalloc((size_t)batchSize * desc->gpoolConv.outChannels * nnXLen * nnYLen * eltSize);
-  void* deviceMidBuf = ascendMalloc(numOutputFloats * eltSize);
   void* deviceTrunkScratch = ascendMalloc(numInputFloats * eltSize);
-
-  // Compute gpool scratch size
-  size_t gpoolElts = (size_t)batchSize * desc->gpoolConv.outChannels;
-  size_t gpoolBytesDtype = gpoolElts * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
-  size_t gpoolBytesFP32 = gpoolElts * sizeof(float);
-  size_t gpoolScratchBytes = 2 * gpoolBytesDtype + 5 * gpoolBytesFP32
-                           + gpoolElts * 3 * sizeof(float)
-                           + (size_t)batchSize * desc->regularConv.outChannels * sizeof(float);
-  void* deviceGpoolScratch = ascendMalloc(gpoolScratchBytes);
 
   // Copy inputs to device
   ascendCopyH2D(deviceInput, inputBuffer.data(), numInputFloats * sizeof(float));
@@ -4135,17 +4116,20 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
     deviceWorkspace = ascendMalloc(workspaceBytes);
   }
 
+  // Create scratch buffers
+  ScratchBuffers scratch(batchSize, nnXLen, nnYLen, useFP16, workspaceBytes);
+
   // Create temporary handle for tensorCache access
   ComputeHandle* tempHandle = new ComputeHandle(0, useFP16, nnXLen, nnYLen, false, false);
   tempHandle->stream = stream;
   tempHandle->initScalars();
   tempHandle->model = nullptr;
   tempHandle->buffers = nullptr;
+  tempHandle->scratch = &scratch;
 
   // Apply global pooling residual block
-  residualBlock->apply(tempHandle, stream, batchSize, deviceMask, deviceMaskSum,
-                       deviceInput, deviceTrunkScratch, deviceMidBuf,
-                       deviceGpoolConvOut, deviceGpoolScratch,
+  residualBlock->apply(tempHandle, &scratch, stream, batchSize, deviceMask, deviceMaskSum,
+                       deviceInput, deviceTrunkScratch,
                        deviceWorkspace, workspaceBytes);
 
   // Synchronize
@@ -4160,10 +4144,7 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   ascendFree(deviceInput);
   ascendFree(deviceMask);
   ascendFree(deviceMaskSum);
-  ascendFree(deviceGpoolConvOut);
-  ascendFree(deviceMidBuf);
   ascendFree(deviceTrunkScratch);
-  ascendFree(deviceGpoolScratch);
   delete residualBlock;
   // Clean up temp handle (stream is owned by us, don't destroy it)
   tempHandle->stream = nullptr;
