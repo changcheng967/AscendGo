@@ -1998,6 +1998,10 @@ struct ResidualBlock {
     aclDataType dtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
     int channels = numChannels;
 
+    aclrtStream stream = handle->stream;
+    int nnXLen = scratch->nnXLen;
+    int nnYLen = scratch->nnYLen;
+
     // Step 1: BN+Act: trunkBuf -> midScratch (preserve trunkBuf for residual)
     preNormActConv->bnLayer->apply(handle, stream, batchSize, trunkBuf, maskBuf, midScratch.buf, workspaceBuf, workspaceBytes);
 
@@ -2011,7 +2015,7 @@ struct ResidualBlock {
     midNormActConv->convLayer->apply(handle, stream, batchSize, nnXLen, nnYLen, false, trunkScratchBuf, midIn.buf, workspaceBuf, workspaceBytes);
 
     // Step 5: Residual add: midIn + trunkBuf -> trunkBuf
-    vector<int64_t addShape = {batchSize, channels, nnYLen, nnXLen};
+    vector<int64_t> addShape = {batchSize, channels, nnYLen, nnXLen};
     aclTensor* midTensor = handle->tensorCache.get(midIn.buf, addShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* trunkTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
     aclTensor* resultTensor = handle->tensorCache.get(trunkBuf, addShape, dtype, ACL_FORMAT_NCHW);
@@ -2541,7 +2545,7 @@ void NestedBottleneckResidualBlock::apply(
 
   // Step 2: innerBlocks operates on mid (as trunk) with midScratch as scratch
   innerBlocks->apply(
-    handle, scratch, batchSize, maskBuf, maskSumBuf,
+    handle, scratch, stream, batchSize, maskBuf, maskSumBuf,
     mid.buf, midScratch.buf,
     workspaceBuf, workspaceBytes
   );
