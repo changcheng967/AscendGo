@@ -2881,50 +2881,34 @@ void Model::apply(
   // The mask is stored in channel 0 of the input tensor.
   // In NCHW layout: input[n, 0, h, w] = mask value (1.0 = valid, 0.0 = padding)
   // maskSumBuf[n] = number of valid board positions for batch element n
+  //
+  // CRITICAL: Channel 0 is NOT contiguous across batches in NCHW!
+  // input[n, c, h, w] is at offset n*C*H*W + c*H*W + h*W + w
+  // So channel 0 of batch n is at offset n*C*H*W, strided by C*H*W per batch.
+  // We must copy each batch element's channel 0 separately.
   {
     aclDataType inputDtype = useFP16 ? ACL_FLOAT16 : ACL_FLOAT;
-    // Create input tensor view restricted to channel 0
-    // We can use aclCreateTensor with offset to select channel 0
-    // For NCHW with shape [N, C, H, W], channel 0 starts at offset 0 with stride [C*H*W, H*W, W, 1]
-    // We want shape [N, 1, H, W] with the same data pointer and stride [C*H*W, H*W, W, 1]
-    int64_t cStride = nnXLen * nnYLen;
-    int64_t inputStride[4] = {cStride * numInputChannels, cStride, (int64_t)nnXLen, 1};
-    vector<int64_t> maskViewShape = {batchSize, 1, nnYLen, nnXLen};
+    size_t eltSize = useFP16 ? sizeof(aclFloat16) : sizeof(float);
+    size_t hwBytes = (size_t)nnYLen * nnXLen * eltSize;
+    size_t batchStride = (size_t)numInputChannels * nnYLen * nnXLen * eltSize;
 
-    aclTensor* inputChannel0Tensor = aclCreateTensor(
-      maskViewShape.data(),                     // viewDims: [N, 1, H, W]
-      static_cast<uint64_t>(maskViewShape.size()), // viewDimsNum
-      inputDtype,                               // dataType
-      inputStride,                              // strides (same as full input)
-      static_cast<int64_t>(0),                  // storageOffset
-      ACL_FORMAT_NCHW,                          // format
-      maskViewShape.data(),                     // storageDims
-      static_cast<uint64_t>(maskViewShape.size()), // storageDimsNum
-      inputBuf                                  // data (same as full input)
-    );
-
-    // Copy channel 0 to maskBuf (same dtype as input)
-    size_t maskBytes = (size_t)batchSize * nnYLen * nnXLen * (useFP16 ? sizeof(aclFloat16) : sizeof(float));
-
-    // Use aclrtMemcpy for device-to-device copy (aclnnCopy doesn't exist in CANN)
-    // maskBuf is at offset 0 of inputBuf, so just copy from inputBuf to maskBuf
-    aclError copyErr = aclrtMemcpyAsync(maskBuf, maskBytes, inputBuf, maskBytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
-    aclDestroyTensor(inputChannel0Tensor);
-    if(copyErr != ACL_SUCCESS) {
-      throw StringError("aclrtMemcpyAsync failed for mask extraction: " + to_string(copyErr));
-    }
-
-    // If requireExactNNLen, set maskBuf to NULL to skip masking in BN layers
-    // (global pooling still needs maskSumBuf for normalization)
-    if(requireExactNNLen) {
-      maskBuf = nullptr;
+    // Copy channel 0 for each batch element with proper NCHW stride
+    for(int n = 0; n < batchSize; n++) {
+      aclError copyErr = aclrtMemcpyAsync(
+        (char*)maskBuf + n * hwBytes, hwBytes,
+        (const char*)inputBuf + n * batchStride, hwBytes,
+        ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+      if(copyErr != ACL_SUCCESS) {
+        throw StringError("aclrtMemcpyAsync failed for mask extraction batch " + to_string(n) + ": " + to_string(copyErr));
+      }
     }
 
     // Compute maskSum: sum mask values across spatial dims for each batch element
     // maskFloatBuf is always float
     aclnnStatus status;
+
+    // Cast mask to FP32 if needed (BEFORE setting maskBuf to nullptr!)
     if(useFP16) {
-      // Cast mask from FP16 to FP32 (device-side aclnnCast)
       size_t numMaskElts = (size_t)batchSize * nnYLen * nnXLen;
       castDeviceFP16ToFP32(stream, buffers->maskFloatBuf, maskBuf, numMaskElts, workspaceBuf, workspaceBytes);
     } else {
@@ -2933,19 +2917,13 @@ void Model::apply(
     }
 
     // Sum across spatial dimensions: [N, 1, H, W] -> [N, 1]
-    // Use aclnnMean with multiplication by area to get sum
-    // Or use aclnnSum with reduction
     aclTensor* maskSumInputTensor = createAclTensor(
       maskFloatBuf, {batchSize, 1, nnYLen, nnXLen}, ACL_FLOAT, ACL_FORMAT_ND);
-    aclTensor* maskSumOutputTensor = createAclTensor(
-      maskSumBuf, {batchSize, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     aclIntArray* sumReduceDims = createAclIntArray({2, 3});
     bool sumKeepDim = true;
 
     uint64_t sumWsSize = 0;
     aclOpExecutor* sumExecutor = nullptr;
-    // Use aclnnMean then multiply by area to get sum (since aclnnSum may not exist)
-    // Actually, let's use aclnnMean and multiply by HW
     aclTensor* meanOutput = createAclTensor(
       maskSumBuf, {batchSize, 1, 1, 1}, ACL_FLOAT, ACL_FORMAT_ND);
     status = aclnnMeanGetWorkspaceSize(maskSumInputTensor, sumReduceDims, sumKeepDim, ACL_FLOAT, meanOutput, &sumWsSize, &sumExecutor);
@@ -2954,7 +2932,6 @@ void Model::apply(
     }
     aclDestroyIntArray(sumReduceDims);
     aclDestroyTensor(maskSumInputTensor);
-    aclDestroyTensor(maskSumOutputTensor);
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnMean failed for mask sum: " + to_string(status));
     }
@@ -2974,6 +2951,13 @@ void Model::apply(
     aclDestroyTensor(meanOutput);
     if(status != ACLNN_SUCCESS) {
       throw StringError("aclnnInplaceMuls failed for mask sum scaling: " + to_string(status));
+    }
+
+    // If requireExactNNLen, set maskBuf to NULL to skip masking in BN layers
+    // (global pooling still needs maskSumBuf for normalization)
+    // IMPORTANT: Do this AFTER computing maskFloatBuf and maskSumBuf from maskBuf!
+    if(requireExactNNLen) {
+      maskBuf = nullptr;
     }
   }
 
